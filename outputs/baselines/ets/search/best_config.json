@@ -1,0 +1,10 @@
+{
+  "train_path": "/home/ppalacios/Documents/Regression_Challenge_3-Walmart/walmart-recruiting-store-sales-forecasting/data/3.processed/train_feat.parquet",
+  "test_path": "/home/ppalacios/Documents/Regression_Challenge_3-Walmart/walmart-recruiting-store-sales-forecasting/data/3.processed/test_feat.parquet",
+  "output_dir": "outputs/baselines/ets",
+  "n_folds": 4,
+  "val_weeks": 13,
+  "max_series": null,
+  "seasonal_periods": 52,
+  "exog_alpha": 1.0
+}

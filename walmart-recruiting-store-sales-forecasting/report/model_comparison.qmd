@@ -41,11 +41,23 @@ PANTONE_GREEN = "#00A651"   # Pantone-style green (approx RGB equivalent)
 PANTONE_ORANGE = "#FF6A13"  # Pantone-style orange (approx RGB equivalent)
 
 def find_project_root() -> Path:
-    candidates = [Path("."), Path(".."), Path("../..")]
-    for c in candidates:
-        if (c / "outputs" / "metrics" / "local_linear_cv.csv").exists():
-            return c.resolve()
-    raise FileNotFoundError("Could not locate project root with outputs/metrics/local_linear_cv.csv")
+    # Prefer the known top-level project root (where you already ran and saved all artifacts).
+    fixed = Path("/home/ppalacios/Documents/Regression_Challenge_3-Walmart")
+    if (fixed / "outputs").exists():
+        return fixed.resolve()
+
+    # Fallback: search upwards from the current directory for the top-level outputs folder.
+    here = Path.cwd().resolve()
+    for p in [here, *here.parents]:
+        if (p / "outputs" / "metrics" / "local_linear_cv.csv").exists():
+            return p
+        if (p / "outputs" / "search" / "phase1" / "search_results.csv").exists():
+            return p
+
+    raise FileNotFoundError(
+        "Could not locate project root. Expected to find top-level 'outputs/metrics/local_linear_cv.csv' "
+        "or 'outputs/search/phase1/search_results.csv'."
+    )
 
 def split_fold_and_mean(cv_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     fold = cv_df[cv_df["fold"].astype(str) != "mean"].copy()
@@ -105,8 +117,8 @@ p1_lite_oof = pd.read_parquet(OUTPUTS / "phase1_local_linear_lite" / "preds" / "
 p1_lite_cfg = json.loads(
     (OUTPUTS / "phase1_local_linear_lite" / "metrics" / "local_linear_config.json").read_text(encoding="utf-8")
 )
-grid_results = pd.read_csv(OUTPUTS / "search" / "local_linear_grid_results.csv")
-best_grid_cfg = json.loads((OUTPUTS / "search" / "best_local_linear_config.json").read_text(encoding="utf-8"))
+grid_results = pd.read_csv(OUTPUTS / "search" / "phase1" / "search_results.csv")
+best_grid_cfg = json.loads((OUTPUTS / "search" / "phase1" / "best_config.json").read_text(encoding="utf-8"))
 
 # Phase 2 (full data)
 p2_cv = pd.read_csv(OUTPUTS / "phase2_structural_ar_full" / "metrics" / "structural_ar_cv.csv")
@@ -172,7 +184,7 @@ Local Linear is a weighted regression that learns a different local coefficient 
 
 ### Mathematical Formulation
 
-For series \(s\) and target seasonal week \(w\):
+For series $s$ and target seasonal week $w$:
 
 $$
 \hat{\beta}_{s,w}
@@ -206,9 +218,9 @@ $$
 
 ```{mermaid}
 flowchart LR
-  A[Read train/test parquet] --> B[Compute climatology per series/store/week]
+  A[Read processed train/test parquet (data/3.processed)] --> B[Compute climatology per series/store/week]
   B --> C[Create anomalies and lag1/lag2]
-  C --> D[Impute missing lag/exogenous values]
+  C --> D[Use pre-imputed exogenous features + fill lag defaults]
   D --> E[Standard-scale Phase 1 features]
   E --> F[Forward-chaining CV]
   F --> G[Fit local weighted ridge by series and seasonal week]
@@ -391,10 +403,10 @@ $$
 
 ```{mermaid}
 flowchart LR
-  A[Read train/test parquet] --> B[Compute climatology and anomalies]
+  A[Read processed train/test parquet (data/3.processed)] --> B[Compute climatology and anomalies]
   B --> C[Create lag1/lag2 and calendar features]
   C --> D[Build exogenous feature matrix]
-  D --> E[Median imputation + standard scaling]
+  D --> E[Use pre-imputed exogenous features + standard scaling]
   E --> F[Fit Elastic Net on train folds]
   F --> G[Recursive forecasting on validation horizon]
   G --> H[OOF metrics and predictions]
@@ -437,13 +449,13 @@ Random Forest is an ensemble of decision trees trained on bootstrap samples. It 
 
 ### Mathematical Formulation
 
-For \(B\) trees:
+For $B$ trees:
 
 $$
 \hat{y}(x)=\frac{1}{B}\sum_{b=1}^{B} T_b(x)
 $$
 
-where each \(T_b\) is grown on a bootstrap sample and split candidates are randomized via `max_features`.
+where each $T_b$ is grown on a bootstrap sample and split candidates are randomized via `max_features`.
 
 ### Plain-Language Meaning of Terms
 
@@ -457,9 +469,9 @@ where each \(T_b\) is grown on a bootstrap sample and split candidates are rando
 
 ```{mermaid}
 flowchart LR
-  A[Read train/test parquet] --> B[Compute climatology and anomalies]
+  A[Read processed train/test parquet (data/3.processed)] --> B[Compute climatology and anomalies]
   B --> C[Create lag1/lag2 + calendar + exogenous features]
-  C --> D[Median imputation]
+  C --> D[Use pre-imputed exogenous features]
   D --> E[Train Random Forest on fold train]
   E --> F[Recursive multi-step rollout on fold validation]
   F --> G[OOF metrics and predictions]
@@ -508,7 +520,7 @@ $$
 y^{anom}_{t,s}=g(x_{t,s}) + r_{t,s},\qquad g(\cdot)\text{ from Ridge regression}
 $$
 
-Residual component \(r_{t,s}\) is modeled by ETS:
+Residual component $r_{t,s}$ is modeled by ETS:
 
 $$
 r_{t,s} = \ell_{t-1,s}+b_{t-1,s}+s_{t-m,s}+\varepsilon_{t,s}
@@ -594,13 +606,13 @@ AdaBoost builds an additive ensemble of shallow trees, where each stage focuses 
 
 ### Mathematical Formulation
 
-With base learners \(h_m\):
+With base learners $h_m$:
 
 $$
 F_M(x)=\sum_{m=1}^{M}\nu_m h_m(x)
 $$
 
-where stage weights depend on chosen boosting loss and learning rate. In practice here, \(h_m\) are depth-limited regression trees.
+where stage weights depend on chosen boosting loss and learning rate. In practice here, $h_m$ are depth-limited regression trees.
 
 ### Plain-Language Meaning of Terms
 
@@ -614,9 +626,9 @@ where stage weights depend on chosen boosting loss and learning rate. In practic
 
 ```{mermaid}
 flowchart LR
-  A[Read train/test parquet] --> B[Compute climatology and anomaly target]
+  A[Read processed train/test parquet (data/3.processed)] --> B[Compute climatology and anomaly target]
   B --> C[Create lag1/lag2 + calendar + exogenous features]
-  C --> D[Median imputation]
+  C --> D[Use pre-imputed exogenous features]
   D --> E[Train AdaBoost regressor on fold train]
   E --> F[Recursive validation rollout]
   F --> G[OOF metrics and predictions]

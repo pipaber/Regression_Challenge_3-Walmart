@@ -1,0 +1,29 @@
+{
+  "train_path": "/home/ppalacios/Documents/Regression_Challenge_3-Walmart/walmart-recruiting-store-sales-forecasting/data/3.processed/train_feat.parquet",
+  "test_path": "/home/ppalacios/Documents/Regression_Challenge_3-Walmart/walmart-recruiting-store-sales-forecasting/data/3.processed/test_feat.parquet",
+  "output_dir": "outputs/phase2_structural_ar",
+  "n_folds": 4,
+  "val_weeks": 13,
+  "max_eval": 3000,
+  "random_seed": 8927,
+  "pred_draws": 80,
+  "fourier_order": 4,
+  "sigma_clusters": 0,
+  "max_series": null,
+  "lag_orders": [
+    1,
+    2
+  ],
+  "exogenous_features": [
+    "temp_anom",
+    "fuel_anom",
+    "MarkDown1",
+    "MarkDown2",
+    "MarkDown3",
+    "MarkDown4",
+    "MarkDown5",
+    "CPI",
+    "Unemployment"
+  ],
+  "note": "Structural AR model with hierarchical series intercept, trend, Fourier seasonality, and recursive validation."
+}

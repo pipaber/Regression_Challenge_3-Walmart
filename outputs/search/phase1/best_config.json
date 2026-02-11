@@ -1,0 +1,16 @@
+{
+  "train_path": "/home/ppalacios/Documents/Regression_Challenge_3-Walmart/walmart-recruiting-store-sales-forecasting/data/3.processed/train_feat.parquet",
+  "test_path": "/home/ppalacios/Documents/Regression_Challenge_3-Walmart/walmart-recruiting-store-sales-forecasting/data/3.processed/test_feat.parquet",
+  "output_dir": "outputs",
+  "kernel": "tricube",
+  "bandwidth": 8,
+  "min_samples": 16,
+  "ridge": 0.0005,
+  "coef_clip": 5.0,
+  "anom_clip_scale": 2.0,
+  "n_folds": 4,
+  "val_weeks": 13,
+  "max_series": null,
+  "use_interactions": false,
+  "feature_mode": "full"
+}

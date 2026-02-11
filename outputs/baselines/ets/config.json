@@ -1,0 +1,37 @@
+{
+  "train_path": "/home/ppalacios/Documents/Regression_Challenge_3-Walmart/walmart-recruiting-store-sales-forecasting/data/3.processed/train_feat.parquet",
+  "test_path": "/home/ppalacios/Documents/Regression_Challenge_3-Walmart/walmart-recruiting-store-sales-forecasting/data/3.processed/test_feat.parquet",
+  "output_dir": "outputs/baselines/ets",
+  "n_folds": 4,
+  "val_weeks": 13,
+  "max_series": null,
+  "seasonal_periods": 52,
+  "exog_alpha": 1.0,
+  "model": "ets",
+  "target": "sales_anom (via exogenous + ETS residual)",
+  "exogenous_features": [
+    "temp_anom",
+    "fuel_anom",
+    "MarkDown1",
+    "MarkDown2",
+    "MarkDown3",
+    "MarkDown4",
+    "MarkDown5",
+    "CPI",
+    "Unemployment"
+  ],
+  "cv_mode_counts": {
+    "level": 10550,
+    "level-trend": 1847,
+    "global-fallback": 77,
+    "last-value-fallback": 51,
+    "level-seasonal": 2
+  },
+  "test_mode_counts": {
+    "level": 2719,
+    "level-trend": 411,
+    "level-seasonal": 8,
+    "global-fallback": 11,
+    "last-value-fallback": 20
+  }
+}

@@ -48,34 +48,29 @@ import json
 
 import numpy as np
 import pandas as pd
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.impute import IterativeImputer
 
-PROJECT_ROOT = Path(".").resolve()
-
-
-def _coerce_markdown_series(series: pd.Series) -> pd.Series:
-    if series.dtype == bool:
-        return series.astype(float)
-    as_str = series.astype(str).str.strip().str.upper()
-    mapped = as_str.map({"TRUE": 1.0, "FALSE": 0.0, "NA": np.nan, "NAN": np.nan, "": np.nan})
-    numeric = pd.to_numeric(series, errors="coerce")
-    if numeric.notna().sum() == 0 and mapped.notna().sum() > 0:
-        return mapped.astype(float)
-    out = numeric.astype(float)
-    mask = out.isna() & mapped.notna()
-    out.loc[mask] = mapped.loc[mask]
-    return out
+PROJECT_ROOT = Path("/home/ppalacios/Documents/Regression_Challenge_3-Walmart")
+DATA_ROOT = PROJECT_ROOT / "walmart-recruiting-store-sales-forecasting" / "data"
+RAW_DIR = DATA_ROOT / "2.extracted"
+PROCESSED_DIR = DATA_ROOT / "3.processed"
 
 
-def ensure_prepared_features(root: Path = PROJECT_ROOT) -> tuple[Path, Path]:
-    train_feat_path = root / "train_feat.parquet"
-    test_feat_path = root / "test_feat.parquet"
-    if train_feat_path.exists() and test_feat_path.exists():
+def ensure_prepared_features(root: Path = PROJECT_ROOT, force: bool = False) -> tuple[Path, Path]:
+    processed_dir = root / "walmart-recruiting-store-sales-forecasting" / "data" / "3.processed"
+    raw_dir = root / "walmart-recruiting-store-sales-forecasting" / "data" / "2.extracted"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    train_feat_path = processed_dir / "train_feat.parquet"
+    test_feat_path = processed_dir / "test_feat.parquet"
+    if not force and train_feat_path.exists() and test_feat_path.exists():
         return train_feat_path, test_feat_path
 
-    train_csv = root / "train.csv"
-    test_csv = root / "test.csv"
-    features_csv = root / "features.csv"
-    stores_csv = root / "stores.csv"
+    train_csv = raw_dir / "train.csv"
+    test_csv = raw_dir / "test.csv"
+    features_csv = raw_dir / "features.csv"
+    stores_csv = raw_dir / "stores.csv"
     required = [train_csv, test_csv, features_csv, stores_csv]
     missing = [str(p) for p in required if not p.exists()]
     if missing:
@@ -89,27 +84,45 @@ def ensure_prepared_features(root: Path = PROJECT_ROOT) -> tuple[Path, Path]:
     for frame in (train, test, features):
         frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
 
-    for frame in (train, test, features):
-        if "IsHoliday" in frame.columns:
-            frame["IsHoliday"] = (
-                frame["IsHoliday"]
-                .astype(str)
-                .str.upper()
-                .map({"TRUE": True, "FALSE": False})
-                .fillna(frame["IsHoliday"])
-            )
-
     for col in ["MarkDown1", "MarkDown2", "MarkDown3", "MarkDown4", "MarkDown5"]:
         if col in features.columns:
-            features[col] = _coerce_markdown_series(features[col])
+            features[col] = features[col].fillna(0)
 
-    train_feat = train.merge(features, on=["Store", "Date", "IsHoliday"], how="left")
+    if {"CPI", "Unemployment"}.issubset(features.columns):
+        imp = IterativeImputer(max_iter=10, random_state=0)
+        imputed = imp.fit_transform(features[["CPI", "Unemployment"]])
+        features = features.drop(columns=["CPI", "Unemployment"])
+        features[["CPI", "Unemployment"]] = imputed
+
+    selected_cols = [
+        "Store",
+        "Date",
+        "Temperature",
+        "Fuel_Price",
+        "MarkDown1",
+        "MarkDown2",
+        "MarkDown3",
+        "MarkDown4",
+        "MarkDown5",
+        "CPI",
+        "Unemployment",
+    ]
+    features = features[selected_cols]
+
+    train_feat = train.merge(features, on=["Store", "Date"], how="left")
     train_feat = train_feat.merge(stores, on=["Store"], how="left")
-    test_feat = test.merge(features, on=["Store", "Date", "IsHoliday"], how="left")
+    test_feat = test.merge(features, on=["Store", "Date"], how="left")
     test_feat = test_feat.merge(stores, on=["Store"], how="left")
 
-    train_feat.to_parquet(train_feat_path, index=False)
-    test_feat.to_parquet(test_feat_path, index=False)
+    # After merging, enforce Markdown1-5 = 0.0 (and numeric) in the final processed frames.
+    for col in ["MarkDown1", "MarkDown2", "MarkDown3", "MarkDown4", "MarkDown5"]:
+        if col in train_feat.columns:
+            train_feat[col] = pd.to_numeric(train_feat[col], errors="coerce").fillna(0.0)
+        if col in test_feat.columns:
+            test_feat[col] = pd.to_numeric(test_feat[col], errors="coerce").fillna(0.0)
+
+    train_feat.to_parquet(train_feat_path, index=False, engine="pyarrow")
+    test_feat.to_parquet(test_feat_path, index=False, engine="pyarrow")
     return train_feat_path, test_feat_path
 
 
@@ -122,7 +135,10 @@ def mean_row_from_metrics(metrics_df: pd.DataFrame) -> dict:
     return metrics_df.iloc[-1].to_dict()
 
 
-train_feat_path, test_feat_path = ensure_prepared_features(PROJECT_ROOT)
+# Use force=True to regenerate processed parquets if you changed preprocessing logic.
+# Use force=True to regenerate processed parquets if you changed preprocessing logic
+# (e.g., to eliminate stale MarkDown NaNs in existing train_feat/test_feat files).
+train_feat_path, test_feat_path = ensure_prepared_features(PROJECT_ROOT, force=True)
 print(f"Using train features: {train_feat_path}")
 print(f"Using test features:  {test_feat_path}")
 ```
@@ -702,8 +718,8 @@ def make_submission(pred_df: pd.DataFrame) -> pd.DataFrame:
 
 def phase1_default_config() -> dict:
     return {
-        "train_path": "train_feat.parquet",
-        "test_path": "test_feat.parquet",
+        "train_path": str(PROCESSED_DIR / "train_feat.parquet"),
+        "test_path": str(PROCESSED_DIR / "test_feat.parquet"),
         "output_dir": "outputs",
         "kernel": "tricube",
         "bandwidth": 6,
@@ -955,7 +971,9 @@ def summarize_metrics(df: pd.DataFrame) -> dict[str, float]:
 def _get_lag_value(hist: deque[float], lag: int) -> float:
     if len(hist) >= lag:
         return float(hist[-lag])
-    return np.nan
+    # Lags are structurally undefined at the start of a series; treat as neutral (0.0)
+    # to avoid NaNs propagating into model inputs during recursive rollout.
+    return 0.0
 
 def _robust_bounds(values: np.ndarray, clip_scale: float = 2.0) -> tuple[float, float]:
     arr = np.asarray(values, dtype=float)
@@ -990,10 +1008,34 @@ def make_supervised_lag_frame(
     for lag in lag_orders:
         out[f"lag{lag}"] = grouped.shift(lag)
 
+    # Lags are structurally undefined at the start of each series; treat them as neutral (0.0)
+    # to avoid dropping all early rows (which can yield empty fold training matrices).
+    for lag in lag_orders:
+        col = f"lag{lag}"
+        if col in out.columns:
+            out[col] = out[col].fillna(0.0)
+
     X = out[feature_cols].copy()
     y = out[TARGET_COL].to_numpy(dtype=float)
+
+    # Keep rows with finite targets; features should be finite after preprocessing + lag fill.
+    # (If exogenous features still contain NaNs after merging, consider fixing preprocessing.)
     valid_mask = np.isfinite(y) & np.all(np.isfinite(X.to_numpy(dtype=float)), axis=1)
-    return X.loc[valid_mask].reset_index(drop=True), y[valid_mask]
+    X_out = X.loc[valid_mask].reset_index(drop=True)
+    y_out = y[valid_mask]
+
+    # Fail fast with a helpful message instead of crashing later inside StandardScaler/estimators.
+    if X_out.shape[0] == 0:
+        bad_counts = (~np.isfinite(X.to_numpy(dtype=float))).sum(axis=0)
+        bad_by_col = {c: int(b) for c, b in zip(X.columns.tolist(), bad_counts) if int(b) > 0}
+        raise ValueError(
+            "make_supervised_lag_frame produced 0 training rows after filtering for finite values. "
+            "This usually means some feature columns still contain NaN/inf in this fold (often from merges), "
+            "or the fold slice is too small. "
+            f"Non-finite counts by feature: {bad_by_col}"
+        )
+
+    return X_out, y_out
 
 def recursive_predict_tabular_anomaly(
     future_df: pd.DataFrame,
@@ -1592,17 +1634,18 @@ def run_cv(train_df: pd.DataFrame, cfg: StructuralARConfig) -> tuple[pd.DataFram
 
 def phase2_default_config() -> dict:
     return {
-        "train_path": "train_feat.parquet",
-        "test_path": "test_feat.parquet",
-        "output_dir": "outputs/phase2_structural_ar_full",
+        "train_path": str(PROCESSED_DIR / "train_feat.parquet"),
+        "test_path": str(PROCESSED_DIR / "test_feat.parquet"),
+        "output_dir": "outputs/phase2_structural_ar",
         "n_folds": 4,
         "val_weeks": 13,
-        "max_eval": 1800,
+        "max_eval": 3000,
         "random_seed": 8927,
-        "pred_draws": 40,
+        "pred_draws": 80,
         "fourier_order": 3,
         "sigma_clusters": 0,
-        "max_series": 3331,
+        # Full run: include all series (no cap). Expect significantly higher runtime.
+        "max_series": None,
     }
 
 
@@ -1732,7 +1775,6 @@ def tune_phase2(
 import json
 from pathlib import Path
 
-from sklearn.impute import SimpleImputer
 from sklearn.linear_model import ElasticNet
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -1740,7 +1782,6 @@ from sklearn.preprocessing import StandardScaler
 def make_model(alpha: float, l1_ratio: float, max_iter: int):
     return Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
             (
                 "model",
@@ -1757,8 +1798,8 @@ def make_model(alpha: float, l1_ratio: float, max_iter: int):
 
 def phase3_default_config() -> dict:
     return {
-        "train_path": "train_feat.parquet",
-        "test_path": "test_feat.parquet",
+        "train_path": str(PROCESSED_DIR / "train_feat.parquet"),
+        "test_path": str(PROCESSED_DIR / "test_feat.parquet"),
         "output_dir": "outputs/baselines/elastic_net",
         "n_folds": 4,
         "val_weeks": 13,
@@ -1884,13 +1925,11 @@ import json
 from pathlib import Path
 
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 
 def make_model(n_estimators: int, max_depth: int, min_samples_leaf: int, max_features: str):
     return Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="median")),
             (
                 "model",
                 RandomForestRegressor(
@@ -1908,8 +1947,8 @@ def make_model(n_estimators: int, max_depth: int, min_samples_leaf: int, max_fea
 
 def phase4_default_config() -> dict:
     return {
-        "train_path": "train_feat.parquet",
-        "test_path": "test_feat.parquet",
+        "train_path": str(PROCESSED_DIR / "train_feat.parquet"),
+        "test_path": str(PROCESSED_DIR / "test_feat.parquet"),
         "output_dir": "outputs/baselines/random_forest",
         "n_folds": 4,
         "val_weeks": 13,
@@ -2050,7 +2089,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -2072,7 +2110,6 @@ EXOG_FEATURE_COLS = [
 def make_exog_model(alpha: float) -> Pipeline:
     return Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
             ("model", Ridge(alpha=alpha)),
         ]
@@ -2294,8 +2331,8 @@ def fit_full_and_predict_test(
 
 def phase5_default_config() -> dict:
     return {
-        "train_path": "train_feat.parquet",
-        "test_path": "test_feat.parquet",
+        "train_path": str(PROCESSED_DIR / "train_feat.parquet"),
+        "test_path": str(PROCESSED_DIR / "test_feat.parquet"),
         "output_dir": "outputs/baselines/ets",
         "n_folds": 4,
         "val_weeks": 13,
@@ -2414,7 +2451,6 @@ import json
 from pathlib import Path
 
 from sklearn.ensemble import AdaBoostRegressor
-from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.tree import DecisionTreeRegressor
 
@@ -2446,7 +2482,6 @@ def make_model(
 
     return Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="median")),
             ("model", model),
         ]
     )
@@ -2454,8 +2489,8 @@ def make_model(
 
 def phase6_default_config() -> dict:
     return {
-        "train_path": "train_feat.parquet",
-        "test_path": "test_feat.parquet",
+        "train_path": str(PROCESSED_DIR / "train_feat.parquet"),
+        "test_path": str(PROCESSED_DIR / "test_feat.parquet"),
         "output_dir": "outputs/baselines/adaboost",
         "n_folds": 4,
         "val_weeks": 13,
@@ -2634,34 +2669,68 @@ phase1_lite_artifacts = run_phase1(PHASE1_LITE_CFG)
 phase1_lite_artifacts
 ```
 
-### Phase 2 Config and Tuning
+### Phase 2 Config (Tune vs Final Full Run)
+
+This phase has two configurations:
+
+- **Tune config (fast-ish):** used only to compare candidates (typically smaller `max_eval` / `pred_draws`).
+- **Final config (full-date artifacts):** used to produce the OOF outputs used in plots.  
+  To match other models' plotting windows, the final run must use `n_folds=4` and `val_weeks=13` (52 validation dates).
+
+#### Phase 2: Tuning Setup (candidates)
 ```{python}
 #| eval: false
 
-
 PHASE2_CFG = phase2_default_config()
+
+# Candidate grid: only structure knobs here. If you include max_eval/pred_draws
+# in candidates, they will override the final-run values unless you force them later.
 PHASE2_SEARCH = [
-    {"fourier_order": 2, "max_eval": 1200, "pred_draws": 20},
-    {"fourier_order": 3, "max_eval": 1800, "pred_draws": 40},
-    {"fourier_order": 4, "max_eval": 1800, "pred_draws": 40},
+    {"fourier_order": 2},
+    {"fourier_order": 3},
+    {"fourier_order": 4},
 ]
+
+# Tuning overrides (can be cheaper than final run)
 PHASE2_TUNE_OVERRIDES = {
-    "n_folds": 2,
-    "val_weeks": 8,
+    "n_folds": 4,
+    "val_weeks": 13,
     "max_series": 600,
+    "max_eval": 1200,
+    "pred_draws": 20,
+    "output_dir": "outputs/phase2_structural_ar",
 }
 ```
 
 ```{python}
 #| eval: false
 
-PHASE2_RESULTS, PHASE2_BEST_CFG = tune_phase2(PHASE2_CFG, PHASE2_SEARCH, tune_overrides=PHASE2_TUNE_OVERRIDES)
+PHASE2_RESULTS, PHASE2_BEST_CFG = tune_phase2(
+    PHASE2_CFG,
+    PHASE2_SEARCH,
+    tune_overrides=PHASE2_TUNE_OVERRIDES,
+    search_output_dir="outputs/phase2_structural_ar/search",
+)
+PHASE2_RESULTS.head()
 ```
 
+#### Phase 2: Final Full Run (artifacts used for plots)
 ```{python}
 #| eval: false
 
-phase2_artifacts = run_phase2(PHASE2_BEST_CFG)
+PHASE2_FINAL_CFG = dict(PHASE2_BEST_CFG)
+PHASE2_FINAL_CFG.update(
+    {
+        "n_folds": 4,
+        "val_weeks": 13,
+        "max_series": None,
+        "max_eval": 3000,
+        "pred_draws": 80,
+        "output_dir": "outputs/phase2_structural_ar",
+    }
+)
+
+phase2_artifacts = run_phase2(PHASE2_FINAL_CFG)
 phase2_artifacts
 ```
 
@@ -2782,11 +2851,23 @@ PANTONE_GREEN = "#00A651"   # Pantone-style green (approx RGB equivalent)
 PANTONE_ORANGE = "#FF6A13"  # Pantone-style orange (approx RGB equivalent)
 
 def find_project_root() -> Path:
-    candidates = [Path("."), Path(".."), Path("../..")]
-    for c in candidates:
-        if (c / "outputs" / "metrics" / "local_linear_cv.csv").exists():
-            return c.resolve()
-    raise FileNotFoundError("Could not locate project root with outputs/metrics/local_linear_cv.csv")
+    # Prefer the known top-level project root (where the artifacts already exist).
+    fixed = Path("/home/ppalacios/Documents/Regression_Challenge_3-Walmart")
+    if (fixed / "outputs").exists():
+        return fixed.resolve()
+
+    # Fallback: search upwards from the current directory for the top-level outputs folder.
+    here = Path.cwd().resolve()
+    for p in [here, *here.parents]:
+        if (p / "outputs" / "metrics" / "local_linear_cv.csv").exists():
+            return p
+        if (p / "outputs" / "search" / "phase1" / "search_results.csv").exists():
+            return p
+
+    raise FileNotFoundError(
+        "Could not locate project root. Expected to find top-level 'outputs/metrics/local_linear_cv.csv' "
+        "or 'outputs/search/phase1/search_results.csv'."
+    )
 
 def split_fold_and_mean(cv_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     fold = cv_df[cv_df["fold"].astype(str) != "mean"].copy()
@@ -2846,13 +2927,19 @@ p1_lite_oof = pd.read_parquet(OUTPUTS / "phase1_local_linear_lite" / "preds" / "
 p1_lite_cfg = json.loads(
     (OUTPUTS / "phase1_local_linear_lite" / "metrics" / "local_linear_config.json").read_text(encoding="utf-8")
 )
-grid_results = pd.read_csv(OUTPUTS / "search" / "local_linear_grid_results.csv")
-best_grid_cfg = json.loads((OUTPUTS / "search" / "best_local_linear_config.json").read_text(encoding="utf-8"))
+grid_results = pd.read_csv(OUTPUTS / "search" / "phase1" / "search_results.csv")
+best_grid_cfg = json.loads((OUTPUTS / "search" / "phase1" / "best_config.json").read_text(encoding="utf-8"))
 
 # Phase 2 (full data)
-p2_cv = pd.read_csv(OUTPUTS / "phase2_structural_ar_full" / "metrics" / "structural_ar_cv.csv")
-p2_oof = pd.read_parquet(OUTPUTS / "phase2_structural_ar_full" / "preds" / "structural_ar_oof.parquet")
-p2_cfg = json.loads((OUTPUTS / "phase2_structural_ar_full" / "metrics" / "structural_ar_config.json").read_text(encoding="utf-8"))
+# Prefer the new aligned output directory; fall back to the legacy folder if artifacts aren't present yet.
+_phase2_dir = OUTPUTS / "phase2_structural_ar"
+_phase2_legacy_dir = OUTPUTS / "phase2_structural_ar_full"
+if not (_phase2_dir / "metrics" / "structural_ar_cv.csv").exists():
+    _phase2_dir = _phase2_legacy_dir
+
+p2_cv = pd.read_csv(_phase2_dir / "metrics" / "structural_ar_cv.csv")
+p2_oof = pd.read_parquet(_phase2_dir / "preds" / "structural_ar_oof.parquet")
+p2_cfg = json.loads((_phase2_dir / "metrics" / "structural_ar_config.json").read_text(encoding="utf-8"))
 
 # Phase 3, 4, 5, 7 baselines
 en_cv = pd.read_csv(BASELINES / "elastic_net" / "metrics.csv")
@@ -2949,7 +3036,7 @@ $$
 flowchart LR
   A[Read train/test parquet] --> B[Compute climatology per series/store/week]
   B --> C[Create anomalies and lag1/lag2]
-  C --> D[Impute missing lag/exogenous values]
+  C --> D[Use pre-imputed exogenous features + fill lag defaults]
   D --> E[Standard-scale Phase 1 features]
   E --> F[Forward-chaining CV]
   F --> G[Fit local weighted ridge by series and seasonal week]
@@ -3135,7 +3222,7 @@ flowchart LR
   A[Read train/test parquet] --> B[Compute climatology and anomalies]
   B --> C[Create lag1/lag2 and calendar features]
   C --> D[Build exogenous feature matrix]
-  D --> E[Median imputation + standard scaling]
+  D --> E[Use pre-imputed exogenous features + standard scaling]
   E --> F[Fit Elastic Net on train folds]
   F --> G[Recursive forecasting on validation horizon]
   G --> H[OOF metrics and predictions]
@@ -3200,7 +3287,7 @@ where each \(T_b\) is grown on a bootstrap sample and split candidates are rando
 flowchart LR
   A[Read train/test parquet] --> B[Compute climatology and anomalies]
   B --> C[Create lag1/lag2 + calendar + exogenous features]
-  C --> D[Median imputation]
+  C --> D[Use pre-imputed exogenous features]
   D --> E[Train Random Forest on fold train]
   E --> F[Recursive multi-step rollout on fold validation]
   F --> G[OOF metrics and predictions]
@@ -3357,7 +3444,7 @@ where stage weights depend on chosen boosting loss and learning rate. In practic
 flowchart LR
   A[Read train/test parquet] --> B[Compute climatology and anomaly target]
   B --> C[Create lag1/lag2 + calendar + exogenous features]
-  C --> D[Median imputation]
+  C --> D[Use pre-imputed exogenous features]
   D --> E[Train AdaBoost regressor on fold train]
   E --> F[Recursive validation rollout]
   F --> G[OOF metrics and predictions]

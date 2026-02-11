@@ -1,0 +1,34 @@
+{
+  "train_path": "/home/ppalacios/Documents/Regression_Challenge_3-Walmart/walmart-recruiting-store-sales-forecasting/data/3.processed/train_feat.parquet",
+  "test_path": "/home/ppalacios/Documents/Regression_Challenge_3-Walmart/walmart-recruiting-store-sales-forecasting/data/3.processed/test_feat.parquet",
+  "output_dir": "outputs/baselines/random_forest",
+  "n_folds": 4,
+  "val_weeks": 13,
+  "max_series": null,
+  "n_estimators": 160,
+  "max_depth": 22,
+  "min_samples_leaf": 1,
+  "max_features": "sqrt",
+  "model": "random_forest",
+  "target": "sales_anom",
+  "features": [
+    "lag1",
+    "lag2",
+    "week_of_year",
+    "month",
+    "is_holiday_int",
+    "temp_anom",
+    "fuel_anom",
+    "MarkDown1",
+    "MarkDown2",
+    "MarkDown3",
+    "MarkDown4",
+    "MarkDown5",
+    "CPI",
+    "Unemployment"
+  ],
+  "lags": [
+    1,
+    2
+  ]
+}
