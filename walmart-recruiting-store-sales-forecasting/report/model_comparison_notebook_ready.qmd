@@ -28,34 +28,109 @@ Additionally, we include a `Phase 1-lite` diagnostic variant in the final compar
 
 Evaluation uses forward-chaining validation and weighted MAE (WMAE).
 
-## Notebook Training Cells (Self-Contained)
+## Notebook Training Cells (Scratch-First, Function-Based)
 
-These cells are self-contained: they do not import local script files. Run the definition cell for a model, then run its training cell.
+These cells are self-contained and intended for notebook execution from scratch.
 
-### Runner Helper
+Key design choices:
+- No `argparse` and no `sys.argv` runner.
+- Hyperparameters are defined in notebook cells.
+- Workflow per phase is: run baseline config -> tune on CV -> save best config -> run final model.
+- `outputs/*/config*.json` are written as outputs, not read as inputs.
 
+### Shared Setup
 ```{python}
 #| eval: false
 
-import sys
+
+from pathlib import Path
+import json
+
+import numpy as np
+import pandas as pd
+
+PROJECT_ROOT = Path(".").resolve()
 
 
-def run_with_argv(main_fn, argv):
-    old_argv = sys.argv[:]
-    sys.argv = argv
-    try:
-        main_fn()
-    finally:
-        sys.argv = old_argv
+def _coerce_markdown_series(series: pd.Series) -> pd.Series:
+    if series.dtype == bool:
+        return series.astype(float)
+    as_str = series.astype(str).str.strip().str.upper()
+    mapped = as_str.map({"TRUE": 1.0, "FALSE": 0.0, "NA": np.nan, "NAN": np.nan, "": np.nan})
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().sum() == 0 and mapped.notna().sum() > 0:
+        return mapped.astype(float)
+    out = numeric.astype(float)
+    mask = out.isna() & mapped.notna()
+    out.loc[mask] = mapped.loc[mask]
+    return out
+
+
+def ensure_prepared_features(root: Path = PROJECT_ROOT) -> tuple[Path, Path]:
+    train_feat_path = root / "train_feat.parquet"
+    test_feat_path = root / "test_feat.parquet"
+    if train_feat_path.exists() and test_feat_path.exists():
+        return train_feat_path, test_feat_path
+
+    train_csv = root / "train.csv"
+    test_csv = root / "test.csv"
+    features_csv = root / "features.csv"
+    stores_csv = root / "stores.csv"
+    required = [train_csv, test_csv, features_csv, stores_csv]
+    missing = [str(p) for p in required if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing required raw files: {missing}")
+
+    train = pd.read_csv(train_csv)
+    test = pd.read_csv(test_csv)
+    features = pd.read_csv(features_csv)
+    stores = pd.read_csv(stores_csv)
+
+    for frame in (train, test, features):
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+
+    for frame in (train, test, features):
+        if "IsHoliday" in frame.columns:
+            frame["IsHoliday"] = (
+                frame["IsHoliday"]
+                .astype(str)
+                .str.upper()
+                .map({"TRUE": True, "FALSE": False})
+                .fillna(frame["IsHoliday"])
+            )
+
+    for col in ["MarkDown1", "MarkDown2", "MarkDown3", "MarkDown4", "MarkDown5"]:
+        if col in features.columns:
+            features[col] = _coerce_markdown_series(features[col])
+
+    train_feat = train.merge(features, on=["Store", "Date", "IsHoliday"], how="left")
+    train_feat = train_feat.merge(stores, on=["Store"], how="left")
+    test_feat = test.merge(features, on=["Store", "Date", "IsHoliday"], how="left")
+    test_feat = test_feat.merge(stores, on=["Store"], how="left")
+
+    train_feat.to_parquet(train_feat_path, index=False)
+    test_feat.to_parquet(test_feat_path, index=False)
+    return train_feat_path, test_feat_path
+
+
+def mean_row_from_metrics(metrics_df: pd.DataFrame) -> dict:
+    if metrics_df.empty:
+        raise ValueError("metrics_df is empty")
+    mask = metrics_df["fold"].astype(str) == "mean"
+    if mask.any():
+        return metrics_df.loc[mask].iloc[0].to_dict()
+    return metrics_df.iloc[-1].to_dict()
+
+
+train_feat_path, test_feat_path = ensure_prepared_features(PROJECT_ROOT)
+print(f"Using train features: {train_feat_path}")
+print(f"Using test features:  {test_feat_path}")
 ```
 
-### Phase 1 Definitions
-
+### Phase 1 Core Definitions
 ```{python}
 #| eval: false
-from __future__ import annotations
 
-import argparse
 import json
 from collections import deque
 from dataclasses import dataclass
@@ -92,7 +167,6 @@ INTERACTION_FEATURE_COLS = [
 ]
 WEEK_PERIOD = 53
 
-
 @dataclass(slots=True)
 class LocalLinearConfig:
     kernel: str
@@ -103,7 +177,6 @@ class LocalLinearConfig:
     anom_clip_scale: float
     use_interactions: bool
     feature_mode: str
-
 
 @dataclass(slots=True)
 class FittedLocalLinear:
@@ -117,55 +190,16 @@ class FittedLocalLinear:
     feature_means: np.ndarray
     feature_stds: np.ndarray
 
-
 def get_feature_cols(config: LocalLinearConfig) -> list[str]:
     cols = list(get_exog_feature_cols(config)) + list(CORE_FEATURE_COLS)
     if config.use_interactions:
         cols.extend(INTERACTION_FEATURE_COLS)
     return cols
 
-
 def get_exog_feature_cols(config: LocalLinearConfig) -> list[str]:
     if config.feature_mode == "lite":
         return list(LITE_EXOG_FEATURE_COLS)
     return list(FULL_EXOG_FEATURE_COLS)
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Phase 1: Local linear regression on anomalies with forward-chaining CV."
-    )
-    parser.add_argument("--train-path", default="train_feat.parquet")
-    parser.add_argument("--test-path", default="test_feat.parquet")
-    parser.add_argument("--output-dir", default="outputs")
-    parser.add_argument("--kernel", choices=["tricube", "exponential"], default="tricube")
-    parser.add_argument("--bandwidth", type=int, default=6, help="Neighborhood width in weeks.")
-    parser.add_argument("--min-samples", type=int, default=16)
-    parser.add_argument("--ridge", type=float, default=1e-4)
-    parser.add_argument("--coef-clip", type=float, default=6.0, help="Absolute clip for non-intercept coefficients.")
-    parser.add_argument(
-        "--anom-clip-scale",
-        type=float,
-        default=2.0,
-        help="How wide recursive anomaly clipping bounds are around train quantiles.",
-    )
-    parser.add_argument("--n-folds", type=int, default=4)
-    parser.add_argument("--val-weeks", type=int, default=13)
-    parser.add_argument("--max-series", type=int, default=None, help="Optional debug subset.")
-    parser.add_argument(
-        "--use-interactions",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use targeted interaction term (holiday x lag1).",
-    )
-    parser.add_argument(
-        "--feature-mode",
-        choices=["full", "lite"],
-        default="full",
-        help="`full` uses all exogenous features; `lite` keeps only temp/fuel exogenous features.",
-    )
-    return parser.parse_args()
-
 
 def weighted_ridge_fit(X: np.ndarray, y: np.ndarray, weights: np.ndarray, ridge: float) -> np.ndarray:
     if X.size == 0:
@@ -184,17 +218,14 @@ def weighted_ridge_fit(X: np.ndarray, y: np.ndarray, weights: np.ndarray, ridge:
     beta = np.linalg.pinv(xtx) @ xty
     return beta.astype(float, copy=False)
 
-
 def regularize_beta(beta: np.ndarray, coef_clip: float) -> np.ndarray:
     out = beta.copy()
     out[1:] = np.clip(out[1:], -coef_clip, coef_clip)
     return out
 
-
 def cyclic_week_distance(weeks: np.ndarray, target_week: int) -> np.ndarray:
     delta = np.abs(weeks - target_week)
     return np.minimum(delta, WEEK_PERIOD - delta)
-
 
 def kernel_weights(distance: np.ndarray, bandwidth: int, kernel: str) -> np.ndarray:
     if kernel == "tricube":
@@ -205,7 +236,6 @@ def kernel_weights(distance: np.ndarray, bandwidth: int, kernel: str) -> np.ndar
     if kernel == "exponential":
         return np.exp(-0.5 * (distance / float(bandwidth)) ** 2)
     raise ValueError(f"Unsupported kernel: {kernel}")
-
 
 def robust_bounds(values: np.ndarray, clip_scale: float) -> tuple[float, float]:
     if values.size == 0:
@@ -220,7 +250,6 @@ def robust_bounds(values: np.ndarray, clip_scale: float) -> tuple[float, float]:
         lower, upper = center - 1.0, center + 1.0
     return (lower, upper)
 
-
 def fit_standard_scaler(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     means = np.mean(X, axis=0)
     stds = np.std(X, axis=0)
@@ -229,10 +258,8 @@ def fit_standard_scaler(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     means[~np.isfinite(means)] = 0.0
     return means.astype(float, copy=False), stds.astype(float, copy=False)
 
-
 def apply_standard_scaler(X: np.ndarray, means: np.ndarray, stds: np.ndarray) -> np.ndarray:
     return (X - means) / stds
-
 
 def load_data(train_path: Path, test_path: Path, max_series: int | None) -> tuple[pd.DataFrame, pd.DataFrame]:
     train = pd.read_parquet(train_path)
@@ -261,7 +288,6 @@ def load_data(train_path: Path, test_path: Path, max_series: int | None) -> tupl
     test = test.sort_values(["Date", "Store", "Dept"]).reset_index(drop=True)
     return train, test
 
-
 def build_forward_folds(
     train_df: pd.DataFrame, n_folds: int, val_weeks: int
 ) -> list[tuple[int, np.ndarray, np.ndarray]]:
@@ -280,7 +306,6 @@ def build_forward_folds(
         val_dates = unique_dates[train_end:val_end]
         folds.append((fold + 1, train_dates, val_dates))
     return folds
-
 
 def compute_climatology(train_df: pd.DataFrame) -> dict[str, pd.DataFrame | dict[str, float]]:
     series = (
@@ -327,7 +352,6 @@ def compute_climatology(train_df: pd.DataFrame) -> dict[str, pd.DataFrame | dict
     }
     return {"series": series, "store": store, "global_week": global_week, "overall": overall}
 
-
 def attach_climatology(
     df: pd.DataFrame, climatology: dict[str, pd.DataFrame | dict[str, float]]
 ) -> pd.DataFrame:
@@ -366,7 +390,6 @@ def attach_climatology(
     ]
     return out.drop(columns=drop_cols, errors="ignore")
 
-
 def add_anomaly_lags(df: pd.DataFrame) -> pd.DataFrame:
     out = df.sort_values(["series_id", "Date"]).copy()
     grp = out.groupby("series_id")["sales_anom"]
@@ -374,7 +397,6 @@ def add_anomaly_lags(df: pd.DataFrame) -> pd.DataFrame:
         out[f"sales_anom_lag{lag}"] = grp.shift(lag)
     out["holiday_x_lag1"] = out["is_holiday_int"] * out["sales_anom_lag1"]
     return out
-
 
 def fit_local_models(train_df: pd.DataFrame, config: LocalLinearConfig) -> FittedLocalLinear:
     feature_cols = get_feature_cols(config)
@@ -472,12 +494,10 @@ def fit_local_models(train_df: pd.DataFrame, config: LocalLinearConfig) -> Fitte
         scaler_stds,
     )
 
-
 def _lag_from_history(hist: deque[float], lag: int) -> float:
     if len(hist) >= lag:
         return float(hist[-lag])
     return 0.0
-
 
 def initialize_history(train_df: pd.DataFrame) -> dict[str, deque[float]]:
     history: dict[str, deque[float]] = {}
@@ -487,7 +507,6 @@ def initialize_history(train_df: pd.DataFrame) -> dict[str, deque[float]]:
         values = group["sales_anom"].dropna().to_numpy(dtype=float)
         history[series_id] = deque(values.tolist(), maxlen=max_lag)
     return history
-
 
 def pick_beta(model: FittedLocalLinear, series_id: str, week_of_year: int) -> np.ndarray:
     direct = model.local_params.get((series_id, week_of_year))
@@ -505,7 +524,6 @@ def pick_beta(model: FittedLocalLinear, series_id: str, week_of_year: int) -> np
     if series_fb is not None:
         return series_fb
     return model.global_fallback
-
 
 def _build_feature_vector(row, hist: deque[float], feature_cols: list[str]) -> np.ndarray:
     def safe_float(value: float) -> float:
@@ -533,7 +551,6 @@ def _build_feature_vector(row, hist: deque[float], feature_cols: list[str]) -> n
         "holiday_x_lag1": safe_float(row.is_holiday_int) * lag_vals["sales_anom_lag1"],
     }
     return np.array([feat[c] for c in feature_cols], dtype=float)
-
 
 def recursive_predict(
     future_df: pd.DataFrame, model: FittedLocalLinear, history: dict[str, deque[float]]
@@ -563,11 +580,9 @@ def recursive_predict(
     pred_df = pd.DataFrame(preds, columns=["row_id", "pred_sales", "pred_anom"])
     return future_df.merge(pred_df, on="row_id", how="left")
 
-
 def wmae(y_true: np.ndarray, y_pred: np.ndarray, holiday: np.ndarray) -> float:
     weights = np.where(holiday, 5.0, 1.0)
     return float(np.average(np.abs(y_true - y_pred), weights=weights))
-
 
 def summarize_metrics(df: pd.DataFrame) -> dict[str, float]:
     y_true = df["Weekly_Sales"].to_numpy(dtype=float)
@@ -583,7 +598,6 @@ def summarize_metrics(df: pd.DataFrame) -> dict[str, float]:
     if "sales_anom" in df.columns and "pred_anom" in df.columns:
         metrics["anom_mae"] = float(np.mean(np.abs(df["sales_anom"] - df["pred_anom"])))
     return metrics
-
 
 def run_cv(
     train_df: pd.DataFrame, config: LocalLinearConfig, n_folds: int, val_weeks: int
@@ -646,7 +660,6 @@ def run_cv(
     oof_df = pd.concat(oof_parts, ignore_index=True) if oof_parts else pd.DataFrame()
     return metrics_df, oof_df
 
-
 def fit_full_and_predict_test(
     train_df: pd.DataFrame, test_df: pd.DataFrame, config: LocalLinearConfig
 ) -> pd.DataFrame:
@@ -663,7 +676,6 @@ def fit_full_and_predict_test(
     pred = recursive_predict(test_full, model, history)
     return pred
 
-
 def ensure_dirs(base: Path) -> dict[str, Path]:
     paths = {
         "root": base,
@@ -674,7 +686,6 @@ def ensure_dirs(base: Path) -> dict[str, Path]:
     for p in paths.values():
         p.mkdir(parents=True, exist_ok=True)
     return paths
-
 
 def make_submission(pred_df: pd.DataFrame) -> pd.DataFrame:
     out = pred_df.copy()
@@ -689,115 +700,166 @@ def make_submission(pred_df: pd.DataFrame) -> pd.DataFrame:
     return submission
 
 
-def main() -> None:
-    args = parse_args()
-    config = LocalLinearConfig(
-        kernel=args.kernel,
-        bandwidth=args.bandwidth,
-        min_samples=args.min_samples,
-        ridge=args.ridge,
-        coef_clip=args.coef_clip,
-        anom_clip_scale=args.anom_clip_scale,
-        use_interactions=args.use_interactions,
-        feature_mode=args.feature_mode,
-    )
-
-    train_path = Path(args.train_path)
-    test_path = Path(args.test_path)
-    output_paths = ensure_dirs(Path(args.output_dir))
-
-    print("Loading data...")
-    train_df, test_df = load_data(train_path, test_path, max_series=args.max_series)
-    print(
-        f"train rows={train_df.shape[0]}, test rows={test_df.shape[0]}, "
-        f"series train={train_df['series_id'].nunique()}, series test={test_df['series_id'].nunique()}"
-    )
-
-    print("\nRunning forward-chaining CV...")
-    metrics_df, oof_df = run_cv(train_df, config=config, n_folds=args.n_folds, val_weeks=args.val_weeks)
-
-    metrics_path = output_paths["metrics"] / "local_linear_cv.csv"
-    metrics_df.to_csv(metrics_path, index=False)
-    print(f"Saved CV metrics -> {metrics_path}")
-
-    oof_path = output_paths["preds"] / "local_linear_oof.parquet"
-    oof_df.to_parquet(oof_path, index=False)
-    print(f"Saved OOF predictions -> {oof_path}")
-
-    print("\nTraining on full train and forecasting test recursively...")
-    test_pred = fit_full_and_predict_test(train_df, test_df, config=config)
-
-    test_pred_path = output_paths["preds"] / "local_linear_test.parquet"
-    test_pred.to_parquet(test_pred_path, index=False)
-    print(f"Saved test predictions -> {test_pred_path}")
-
-    submission = make_submission(test_pred)
-    submission_path = output_paths["submissions"] / "local_linear_submission.csv"
-    submission.to_csv(submission_path, index=False)
-    print(f"Saved submission -> {submission_path}")
-
-    config_path = output_paths["metrics"] / "local_linear_config.json"
-    config_payload = {
-        "kernel": args.kernel,
-        "bandwidth": args.bandwidth,
-        "min_samples": args.min_samples,
-        "ridge": args.ridge,
-        "coef_clip": args.coef_clip,
-        "anom_clip_scale": args.anom_clip_scale,
-        "lags": list(LAG_ORDERS),
-        "feature_mode": args.feature_mode,
-        "exogenous_features": get_exog_feature_cols(config),
-        "use_interactions": args.use_interactions,
-        "interaction_cols": INTERACTION_FEATURE_COLS if args.use_interactions else [],
-        "feature_cols": get_feature_cols(config),
-        "standard_scaler": True,
-        "n_folds": args.n_folds,
-        "val_weeks": args.val_weeks,
-        "max_series": args.max_series,
+def phase1_default_config() -> dict:
+    return {
+        "train_path": "train_feat.parquet",
+        "test_path": "test_feat.parquet",
+        "output_dir": "outputs",
+        "kernel": "tricube",
+        "bandwidth": 6,
+        "min_samples": 16,
+        "ridge": 1e-4,
+        "coef_clip": 6.0,
+        "anom_clip_scale": 2.0,
+        "n_folds": 4,
+        "val_weeks": 13,
+        "max_series": None,
+        "use_interactions": False,
+        "feature_mode": "full",
     }
+
+
+def run_phase1(
+    config: dict | None = None,
+    _LocalLinearConfig=LocalLinearConfig,
+    _ensure_dirs=ensure_dirs,
+    _load_data=load_data,
+    _run_cv=run_cv,
+    _fit_full_and_predict_test=fit_full_and_predict_test,
+    _make_submission=make_submission,
+    _get_exog_feature_cols=get_exog_feature_cols,
+    _get_feature_cols=get_feature_cols,
+) -> dict[str, Path]:
+    cfg = phase1_default_config()
+    if config:
+        cfg.update(config)
+
+    ll_cfg = _LocalLinearConfig(
+        kernel=cfg["kernel"],
+        bandwidth=int(cfg["bandwidth"]),
+        min_samples=int(cfg["min_samples"]),
+        ridge=float(cfg["ridge"]),
+        coef_clip=float(cfg["coef_clip"]),
+        anom_clip_scale=float(cfg["anom_clip_scale"]),
+        use_interactions=bool(cfg["use_interactions"]),
+        feature_mode=str(cfg["feature_mode"]),
+    )
+
+    out = _ensure_dirs(Path(cfg["output_dir"]))
+    train_df, test_df = _load_data(
+        Path(cfg["train_path"]),
+        Path(cfg["test_path"]),
+        max_series=cfg.get("max_series"),
+    )
+
+    metrics_df, oof_df = _run_cv(
+        train_df,
+        config=ll_cfg,
+        n_folds=int(cfg["n_folds"]),
+        val_weeks=int(cfg["val_weeks"]),
+    )
+
+    metrics_path = out["metrics"] / "local_linear_cv.csv"
+    oof_path = out["preds"] / "local_linear_oof.parquet"
+    metrics_df.to_csv(metrics_path, index=False)
+    oof_df.to_parquet(oof_path, index=False)
+
+    test_pred = _fit_full_and_predict_test(train_df, test_df, config=ll_cfg)
+    test_pred_path = out["preds"] / "local_linear_test.parquet"
+    test_pred.to_parquet(test_pred_path, index=False)
+
+    submission = _make_submission(test_pred)
+    submission_path = out["submissions"] / "local_linear_submission.csv"
+    submission.to_csv(submission_path, index=False)
+
+    config_payload = {
+        **cfg,
+        "lags": list(LAG_ORDERS),
+        "interaction_cols": INTERACTION_FEATURE_COLS if cfg["use_interactions"] else [],
+        "exogenous_features": _get_exog_feature_cols(ll_cfg),
+        "feature_cols": _get_feature_cols(ll_cfg),
+        "standard_scaler": True,
+    }
+    config_path = out["metrics"] / "local_linear_config.json"
     config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
-    print(f"Saved run config -> {config_path}")
 
-phase1_main = main
+    return {
+        "metrics": metrics_path,
+        "oof": oof_path,
+        "test": test_pred_path,
+        "submission": submission_path,
+        "config": config_path,
+    }
+
+
+def tune_phase1(
+    base_config: dict,
+    search_space: list[dict],
+    search_output_dir: str = "outputs/search/phase1",
+    _LocalLinearConfig=LocalLinearConfig,
+    _load_data=load_data,
+    _run_cv=run_cv,
+) -> tuple[pd.DataFrame, dict]:
+    cfg0 = phase1_default_config()
+    cfg0.update(base_config)
+
+    train_df, _ = _load_data(
+        Path(cfg0["train_path"]),
+        Path(cfg0["test_path"]),
+        max_series=cfg0.get("max_series"),
+    )
+
+    rows: list[dict] = []
+    best_cfg: dict | None = None
+    best_wmae = float("inf")
+
+    for idx, cand in enumerate(search_space, start=1):
+        cfg = {**cfg0, **cand}
+        ll_cfg = _LocalLinearConfig(
+            kernel=cfg["kernel"],
+            bandwidth=int(cfg["bandwidth"]),
+            min_samples=int(cfg["min_samples"]),
+            ridge=float(cfg["ridge"]),
+            coef_clip=float(cfg["coef_clip"]),
+            anom_clip_scale=float(cfg["anom_clip_scale"]),
+            use_interactions=bool(cfg["use_interactions"]),
+            feature_mode=str(cfg["feature_mode"]),
+        )
+
+        metrics_df, _ = _run_cv(
+            train_df,
+            config=ll_cfg,
+            n_folds=int(cfg["n_folds"]),
+            val_weeks=int(cfg["val_weeks"]),
+        )
+        mean_row = mean_row_from_metrics(metrics_df)
+        wmae_val = float(mean_row["wmae"])
+        rec = {
+            "candidate": idx,
+            **cand,
+            "wmae": wmae_val,
+            "mae": float(mean_row.get("mae", np.nan)),
+            "rmse": float(mean_row.get("rmse", np.nan)),
+        }
+        rows.append(rec)
+
+        if wmae_val < best_wmae:
+            best_wmae = wmae_val
+            best_cfg = cfg
+
+    results_df = pd.DataFrame(rows).sort_values("wmae").reset_index(drop=True)
+    out_dir = Path(search_output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(out_dir / "search_results.csv", index=False)
+    if best_cfg is None:
+        raise RuntimeError("Phase 1 tuning did not evaluate any candidates")
+    (out_dir / "best_config.json").write_text(json.dumps(best_cfg, indent=2), encoding="utf-8")
+    return results_df, best_cfg
 ```
 
-### Phase 1 Full Run
-
+### Baseline Utility Definitions
 ```{python}
 #| eval: false
-
-run_with_argv(
-    phase1_main,
-    [
-        "phase1_local_linear",
-        "--output-dir", "outputs",
-        "--feature-mode", "full",
-        "--no-use-interactions",
-    ],
-)
-```
-
-### Phase 1-lite Run
-
-```{python}
-#| eval: false
-
-run_with_argv(
-    phase1_main,
-    [
-        "phase1_local_linear",
-        "--output-dir", "outputs/phase1_local_linear_lite",
-        "--feature-mode", "lite",
-        "--no-use-interactions",
-    ],
-)
-```
-
-### Baseline Utilities Definitions
-
-```{python}
-#| eval: false
-from __future__ import annotations
 
 import time
 from collections import deque
@@ -806,7 +868,6 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
-
 
 TARGET_COL = "sales_anom"
 LAG_ORDERS = (1, 2)
@@ -830,7 +891,6 @@ ANOM_FEATURE_COLS = [
     *EXOG_FEATURE_COLS,
 ]
 
-
 def load_data(train_path: Path, test_path: Path, max_series: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     train = pd.read_parquet(train_path).copy()
     test = pd.read_parquet(test_path).copy()
@@ -853,7 +913,6 @@ def load_data(train_path: Path, test_path: Path, max_series: int | None = None) 
     test = test.sort_values(["Date", "Store", "Dept"]).reset_index(drop=True)
     return train, test
 
-
 def build_forward_folds(train_df: pd.DataFrame, n_folds: int, val_weeks: int) -> list[tuple[int, np.ndarray, np.ndarray]]:
     unique_dates = np.array(sorted(train_df["Date"].dropna().unique()))
     initial_train = len(unique_dates) - (n_folds * val_weeks)
@@ -871,16 +930,13 @@ def build_forward_folds(train_df: pd.DataFrame, n_folds: int, val_weeks: int) ->
         folds.append((fold + 1, train_dates, val_dates))
     return folds
 
-
 def ensure_output_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
 
-
 def wmae(y_true: np.ndarray, y_pred: np.ndarray, holiday: np.ndarray) -> float:
     weights = np.where(holiday, 5.0, 1.0)
     return float(np.average(np.abs(y_true - y_pred), weights=weights))
-
 
 def summarize_metrics(df: pd.DataFrame) -> dict[str, float]:
     y_true = df["Weekly_Sales"].to_numpy(dtype=float)
@@ -896,12 +952,10 @@ def summarize_metrics(df: pd.DataFrame) -> dict[str, float]:
         metrics["anom_mae"] = float(np.mean(np.abs(df["sales_anom"] - df["pred_anom"])))
     return metrics
 
-
 def _get_lag_value(hist: deque[float], lag: int) -> float:
     if len(hist) >= lag:
         return float(hist[-lag])
     return np.nan
-
 
 def _robust_bounds(values: np.ndarray, clip_scale: float = 2.0) -> tuple[float, float]:
     arr = np.asarray(values, dtype=float)
@@ -918,7 +972,6 @@ def _robust_bounds(values: np.ndarray, clip_scale: float = 2.0) -> tuple[float, 
         lower, upper = center - 1.0, center + 1.0
     return (lower, upper)
 
-
 def initialize_target_history(train_df: pd.DataFrame, max_lag: int) -> dict[str, deque[float]]:
     history: dict[str, deque[float]] = {}
     ordered = train_df.sort_values(["series_id", "Date"])
@@ -926,7 +979,6 @@ def initialize_target_history(train_df: pd.DataFrame, max_lag: int) -> dict[str,
         values = group[TARGET_COL].dropna().to_numpy(dtype=float)
         history[series_id] = deque(values.tolist(), maxlen=max_lag)
     return history
-
 
 def make_supervised_lag_frame(
     train_df: pd.DataFrame,
@@ -942,7 +994,6 @@ def make_supervised_lag_frame(
     y = out[TARGET_COL].to_numpy(dtype=float)
     valid_mask = np.isfinite(y) & np.all(np.isfinite(X.to_numpy(dtype=float)), axis=1)
     return X.loc[valid_mask].reset_index(drop=True), y[valid_mask]
-
 
 def recursive_predict_tabular_anomaly(
     future_df: pd.DataFrame,
@@ -1001,7 +1052,6 @@ def recursive_predict_tabular_anomaly(
 
     pred_df = pd.DataFrame(preds, columns=["row_id", "pred_sales", "pred_anom"])
     return ordered.merge(pred_df, on="row_id", how="left")
-
 
 def run_cv_tabular_baseline_anomaly(
     train_df: pd.DataFrame,
@@ -1083,7 +1133,6 @@ def run_cv_tabular_baseline_anomaly(
     oof_df = pd.concat(oof_parts, ignore_index=True) if oof_parts else pd.DataFrame()
     return metrics_df, oof_df
 
-
 def fit_full_train_and_predict_test_tabular_anomaly(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -1115,13 +1164,10 @@ def fit_full_train_and_predict_test_tabular_anomaly(
     ].copy()
 ```
 
-### Phase 2 Definitions
-
+### Phase 2 Core Definitions
 ```{python}
 #| eval: false
-from __future__ import annotations
 
-import argparse
 import json
 import time
 from collections import deque
@@ -1131,7 +1177,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pymc as pm
-
 
 TARGET_COL = "sales_anom"
 PERIOD_WEEKS = 52.0
@@ -1149,12 +1194,10 @@ EXOG_COLS = [
     "Unemployment",
 ]
 
-
 @dataclass(slots=True)
 class ScaleStats:
     mean: float
     std: float
-
 
 @dataclass(slots=True)
 class StructuralARConfig:
@@ -1166,41 +1209,11 @@ class StructuralARConfig:
     fourier_order: int
     sigma_clusters: int
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Phase 2: Structural AR + trend + seasonal Fourier model with recursive validation."
-    )
-    parser.add_argument("--train-path", default="train_feat.parquet")
-    parser.add_argument("--test-path", default="test_feat.parquet")
-    parser.add_argument("--output-dir", default="outputs/phase2_structural_ar")
-    parser.add_argument("--n-folds", type=int, default=4)
-    parser.add_argument("--val-weeks", type=int, default=13)
-    parser.add_argument("--max-eval", type=int, default=3000)
-    parser.add_argument("--random-seed", type=int, default=8927)
-    parser.add_argument("--pred-draws", type=int, default=80)
-    parser.add_argument("--fourier-order", type=int, default=3)
-    parser.add_argument(
-        "--sigma-clusters",
-        type=int,
-        default=0,
-        help="Number of series-level noise clusters for heteroskedastic sigma (0 disables).",
-    )
-    parser.add_argument(
-        "--max-series",
-        type=int,
-        default=200,
-        help="Subset of Store-Dept series for tractable PyMC structural model.",
-    )
-    return parser.parse_args()
-
-
 def ensure_dirs(base: Path) -> dict[str, Path]:
     paths = {"root": base, "metrics": base / "metrics", "preds": base / "preds"}
     for p in paths.values():
         p.mkdir(parents=True, exist_ok=True)
     return paths
-
 
 def fit_standardizer(series: pd.Series) -> ScaleStats:
     mean = float(series.mean())
@@ -1209,10 +1222,8 @@ def fit_standardizer(series: pd.Series) -> ScaleStats:
         std = 1.0
     return ScaleStats(mean=mean, std=std)
 
-
 def zscore(values: np.ndarray, stats: ScaleStats) -> np.ndarray:
     return (values - stats.mean) / stats.std
-
 
 def add_structural_features(
     train_df: pd.DataFrame,
@@ -1237,7 +1248,6 @@ def add_structural_features(
         fourier_cols.extend([sin_col, cos_col])
 
     return train_df, val_df, fourier_cols
-
 
 def prepare_fold_data(
     train_df: pd.DataFrame,
@@ -1279,12 +1289,10 @@ def prepare_fold_data(
     )
     return fold_train, fold_val, fourier_cols
 
-
 def _lag_from_history(hist: deque[float], lag: int) -> float:
     if len(hist) >= lag:
         return float(hist[-lag])
     return 0.0
-
 
 def initialize_history(train_part: pd.DataFrame) -> dict[str, deque[float]]:
     history: dict[str, deque[float]] = {}
@@ -1294,7 +1302,6 @@ def initialize_history(train_part: pd.DataFrame) -> dict[str, deque[float]]:
         vals = grp[TARGET_COL].dropna().to_numpy(dtype=float)
         history[series_id] = deque(vals.tolist(), maxlen=max_lag)
     return history
-
 
 def build_sigma_clusters(train_part: pd.DataFrame, n_clusters: int) -> dict[str, int]:
     if n_clusters <= 1:
@@ -1312,7 +1319,6 @@ def build_sigma_clusters(train_part: pd.DataFrame, n_clusters: int) -> dict[str,
     labels = pd.qcut(series_stats["anom_std"], q=k, labels=False, duplicates="drop")
     labels = labels.fillna(0).astype(int)
     return dict(zip(series_stats["series_id"], labels))
-
 
 def fit_structural_model(
     train_part: pd.DataFrame,
@@ -1410,7 +1416,6 @@ def fit_structural_model(
     }
     return fitted
 
-
 def recursive_predict_with_uncertainty(
     val_part: pd.DataFrame,
     fitted: dict,
@@ -1506,7 +1511,6 @@ def recursive_predict_with_uncertainty(
     pred_sd = sd_series.reindex(val_part.index).to_numpy(dtype=float)
     return pred_mean, pred_sd
 
-
 def evaluate_fold(val_df: pd.DataFrame) -> dict[str, float]:
     y_true = val_df["Weekly_Sales"].to_numpy(dtype=float)
     y_pred = val_df["pred_sales"].to_numpy(dtype=float)
@@ -1518,7 +1522,6 @@ def evaluate_fold(val_df: pd.DataFrame) -> dict[str, float]:
         "anom_mae": float(np.mean(np.abs(val_df["sales_anom"] - val_df["pred_anom"]))),
         "n_rows": float(len(val_df)),
     }
-
 
 def run_cv(train_df: pd.DataFrame, cfg: StructuralARConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
     folds = build_forward_folds(train_df, n_folds=cfg.n_folds, val_weeks=cfg.val_weeks)
@@ -1587,88 +1590,145 @@ def run_cv(train_df: pd.DataFrame, cfg: StructuralARConfig) -> tuple[pd.DataFram
     return metrics_df, oof_df
 
 
-def main() -> None:
-    args = parse_args()
-    out = ensure_dirs(Path(args.output_dir))
-    cfg = StructuralARConfig(
-        n_folds=args.n_folds,
-        val_weeks=args.val_weeks,
-        max_eval=args.max_eval,
-        random_seed=args.random_seed,
-        pred_draws=args.pred_draws,
-        fourier_order=args.fourier_order,
-        sigma_clusters=args.sigma_clusters,
+def phase2_default_config() -> dict:
+    return {
+        "train_path": "train_feat.parquet",
+        "test_path": "test_feat.parquet",
+        "output_dir": "outputs/phase2_structural_ar_full",
+        "n_folds": 4,
+        "val_weeks": 13,
+        "max_eval": 1800,
+        "random_seed": 8927,
+        "pred_draws": 40,
+        "fourier_order": 3,
+        "sigma_clusters": 0,
+        "max_series": 3331,
+    }
+
+
+def run_phase2(
+    config: dict | None = None,
+    _ensure_dirs=ensure_dirs,
+    _StructuralARConfig=StructuralARConfig,
+    _load_data=load_data,
+    _run_cv=run_cv,
+) -> dict[str, Path]:
+    cfg = phase2_default_config()
+    if config:
+        cfg.update(config)
+
+    out = _ensure_dirs(Path(cfg["output_dir"]))
+    model_cfg = _StructuralARConfig(
+        n_folds=int(cfg["n_folds"]),
+        val_weeks=int(cfg["val_weeks"]),
+        max_eval=int(cfg["max_eval"]),
+        random_seed=int(cfg["random_seed"]),
+        pred_draws=int(cfg["pred_draws"]),
+        fourier_order=int(cfg["fourier_order"]),
+        sigma_clusters=int(cfg["sigma_clusters"]),
     )
 
-    print("Loading data...")
-    train_df, _ = load_data(
-        Path(args.train_path),
-        Path(args.test_path),
-        max_series=args.max_series,
-    )
-    print(
-        f"rows={len(train_df)}, series={train_df['series_id'].nunique()}, "
-        f"max_series={args.max_series}"
+    max_series = cfg.get("max_series")
+    if max_series is not None:
+        max_series = int(max_series)
+
+    train_df, _ = _load_data(
+        Path(cfg["train_path"]),
+        Path(cfg["test_path"]),
+        max_series=max_series,
     )
 
-    metrics_df, oof_df = run_cv(train_df, cfg=cfg)
+    metrics_df, oof_df = _run_cv(train_df, cfg=model_cfg)
     metrics_path = out["metrics"] / "structural_ar_cv.csv"
     oof_path = out["preds"] / "structural_ar_oof.parquet"
     metrics_df.to_csv(metrics_path, index=False)
     oof_df.to_parquet(oof_path, index=False)
 
-    cfg_payload = {
-        "n_folds": args.n_folds,
-        "val_weeks": args.val_weeks,
-        "max_eval": args.max_eval,
-        "random_seed": args.random_seed,
-        "pred_draws": args.pred_draws,
-        "fourier_order": args.fourier_order,
+    config_payload = {
+        **cfg,
         "lag_orders": list(LAG_ORDERS),
         "exogenous_features": EXOG_COLS,
-        "sigma_clusters": args.sigma_clusters,
-        "max_series": args.max_series,
         "note": "Structural AR model with hierarchical series intercept, trend, Fourier seasonality, and recursive validation.",
     }
-    cfg_path = out["metrics"] / "structural_ar_config.json"
-    cfg_path.write_text(json.dumps(cfg_payload, indent=2), encoding="utf-8")
+    config_path = out["metrics"] / "structural_ar_config.json"
+    config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
 
-    print(f"Saved metrics -> {metrics_path}")
-    print(f"Saved OOF preds -> {oof_path}")
-    print(f"Saved config -> {cfg_path}")
+    return {
+        "metrics": metrics_path,
+        "oof": oof_path,
+        "config": config_path,
+    }
 
-phase2_main = main
+
+def tune_phase2(
+    base_config: dict,
+    search_space: list[dict],
+    tune_overrides: dict | None = None,
+    search_output_dir: str = "outputs/phase2_structural_ar_full/search",
+    _StructuralARConfig=StructuralARConfig,
+    _load_data=load_data,
+    _run_cv=run_cv,
+) -> tuple[pd.DataFrame, dict]:
+    cfg0 = phase2_default_config()
+    cfg0.update(base_config)
+    if tune_overrides:
+        cfg0.update(tune_overrides)
+
+    rows: list[dict] = []
+    best_cfg: dict | None = None
+    best_wmae = float("inf")
+
+    for idx, cand in enumerate(search_space, start=1):
+        cfg = {**cfg0, **cand}
+        model_cfg = _StructuralARConfig(
+            n_folds=int(cfg["n_folds"]),
+            val_weeks=int(cfg["val_weeks"]),
+            max_eval=int(cfg["max_eval"]),
+            random_seed=int(cfg["random_seed"]),
+            pred_draws=int(cfg["pred_draws"]),
+            fourier_order=int(cfg["fourier_order"]),
+            sigma_clusters=int(cfg["sigma_clusters"]),
+        )
+
+        max_series = cfg.get("max_series")
+        if max_series is not None:
+            max_series = int(max_series)
+
+        train_df, _ = _load_data(
+            Path(cfg["train_path"]),
+            Path(cfg["test_path"]),
+            max_series=max_series,
+        )
+
+        metrics_df, _ = _run_cv(train_df, cfg=model_cfg)
+        mean_row = mean_row_from_metrics(metrics_df)
+        wmae_val = float(mean_row["wmae"])
+        rec = {
+            "candidate": idx,
+            **cand,
+            "wmae": wmae_val,
+            "mae": float(mean_row.get("mae", np.nan)),
+            "rmse": float(mean_row.get("rmse", np.nan)),
+        }
+        rows.append(rec)
+        if wmae_val < best_wmae:
+            best_wmae = wmae_val
+            best_cfg = cfg
+
+    results_df = pd.DataFrame(rows).sort_values("wmae").reset_index(drop=True)
+    out_dir = Path(search_output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(out_dir / "search_results.csv", index=False)
+    if best_cfg is None:
+        raise RuntimeError("Phase 2 tuning did not evaluate any candidates")
+    (out_dir / "best_config.json").write_text(json.dumps(best_cfg, indent=2), encoding="utf-8")
+    return results_df, best_cfg
 ```
 
-### Phase 2 Run
-
+### Phase 3 Core Definitions
 ```{python}
 #| eval: false
 
-run_with_argv(
-    phase2_main,
-    [
-        "phase2_structural_ar",
-        "--output-dir", "outputs/phase2_structural_ar_full",
-        "--max-series", "3331",
-        "--max-eval", "1800",
-        "--pred-draws", "40",
-        "--n-folds", "4",
-        "--val-weeks", "13",
-        "--fourier-order", "3",
-        "--random-seed", "8927",
-        "--sigma-clusters", "0",
-    ],
-)
-```
-
-### Phase 3 Definitions
-
-```{python}
-#| eval: false
-from __future__ import annotations
-
-import argparse
 import json
 from pathlib import Path
 
@@ -1676,25 +1736,6 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import ElasticNet
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Phase 3: Elastic Net anomaly baseline with recursive forward-chaining evaluation."
-    )
-    parser.add_argument("--train-path", default="train_feat.parquet")
-    parser.add_argument("--test-path", default="test_feat.parquet")
-    parser.add_argument("--output-dir", default="outputs/baselines/elastic_net")
-    parser.add_argument("--n-folds", type=int, default=4)
-    parser.add_argument("--val-weeks", type=int, default=13)
-    parser.add_argument("--max-series", type=int, default=None)
-
-    parser.add_argument("--alpha", type=float, default=0.02)
-    parser.add_argument("--l1-ratio", type=float, default=0.2)
-    parser.add_argument("--max-iter", type=int, default=10000)
-    return parser.parse_args()
-
 
 def make_model(alpha: float, l1_ratio: float, max_iter: int):
     return Pipeline(
@@ -1714,109 +1755,137 @@ def make_model(alpha: float, l1_ratio: float, max_iter: int):
     )
 
 
-def main() -> None:
-    args = parse_args()
-    output_dir = ensure_output_dir(Path(args.output_dir))
+def phase3_default_config() -> dict:
+    return {
+        "train_path": "train_feat.parquet",
+        "test_path": "test_feat.parquet",
+        "output_dir": "outputs/baselines/elastic_net",
+        "n_folds": 4,
+        "val_weeks": 13,
+        "max_series": None,
+        "alpha": 0.02,
+        "l1_ratio": 0.2,
+        "max_iter": 10000,
+    }
 
-    print("Loading data...")
-    train_df, test_df = load_data(Path(args.train_path), Path(args.test_path), max_series=args.max_series)
-    print(
-        f"train rows={train_df.shape[0]}, test rows={test_df.shape[0]}, "
-        f"train series={train_df['series_id'].nunique()}, test series={test_df['series_id'].nunique()}"
+
+def run_phase3(
+    config: dict | None = None,
+    _ensure_output_dir=ensure_output_dir,
+    _load_data=load_data,
+    _run_cv=run_cv_tabular_baseline_anomaly,
+    _fit_full=fit_full_train_and_predict_test_tabular_anomaly,
+    _make_model=make_model,
+) -> dict[str, Path]:
+    cfg = phase3_default_config()
+    if config:
+        cfg.update(config)
+
+    out_dir = _ensure_output_dir(Path(cfg["output_dir"]))
+    train_df, test_df = _load_data(
+        Path(cfg["train_path"]),
+        Path(cfg["test_path"]),
+        max_series=cfg.get("max_series"),
     )
 
-    print("\nRunning recursive forward-chaining CV...")
-    metrics_df, oof_df = run_cv_tabular_baseline_anomaly(
+    metrics_df, oof_df = _run_cv(
         train_df,
-        model_builder=lambda: make_model(args.alpha, args.l1_ratio, args.max_iter),
-        n_folds=args.n_folds,
-        val_weeks=args.val_weeks,
+        model_builder=lambda: _make_model(float(cfg["alpha"]), float(cfg["l1_ratio"]), int(cfg["max_iter"])),
+        n_folds=int(cfg["n_folds"]),
+        val_weeks=int(cfg["val_weeks"]),
         lag_orders=LAG_ORDERS,
         feature_cols=ANOM_FEATURE_COLS,
     )
 
-    metrics_path = output_dir / "metrics.csv"
+    metrics_path = out_dir / "metrics.csv"
+    oof_path = out_dir / "oof.parquet"
     metrics_df.to_csv(metrics_path, index=False)
-    print(f"Saved metrics -> {metrics_path}")
-
-    oof_path = output_dir / "oof.parquet"
     oof_df.to_parquet(oof_path, index=False)
-    print(f"Saved OOF predictions -> {oof_path}")
 
-    print("\nFitting full train and forecasting test recursively...")
-    test_pred = fit_full_train_and_predict_test_tabular_anomaly(
+    test_pred = _fit_full(
         train_df,
         test_df,
-        model_builder=lambda: make_model(args.alpha, args.l1_ratio, args.max_iter),
+        model_builder=lambda: _make_model(float(cfg["alpha"]), float(cfg["l1_ratio"]), int(cfg["max_iter"])),
         lag_orders=LAG_ORDERS,
         feature_cols=ANOM_FEATURE_COLS,
     )
-    test_path = output_dir / "test.parquet"
+    test_path = out_dir / "test.parquet"
     test_pred.to_parquet(test_path, index=False)
-    print(f"Saved test predictions -> {test_path}")
 
-    config = {
+    config_payload = {
+        **cfg,
         "model": "elastic_net",
         "target": "sales_anom",
         "features": ANOM_FEATURE_COLS,
         "lags": list(LAG_ORDERS),
-        "alpha": args.alpha,
-        "l1_ratio": args.l1_ratio,
-        "max_iter": args.max_iter,
-        "n_folds": args.n_folds,
-        "val_weeks": args.val_weeks,
-        "max_series": args.max_series,
-        "train_path": args.train_path,
-        "test_path": args.test_path,
     }
-    config_path = output_dir / "config.json"
-    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-    print(f"Saved config -> {config_path}")
+    config_path = out_dir / "config.json"
+    config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
 
-phase3_main = main
+    return {"metrics": metrics_path, "oof": oof_path, "test": test_path, "config": config_path}
+
+
+def tune_phase3(
+    base_config: dict,
+    search_space: list[dict],
+    search_output_dir: str = "outputs/baselines/elastic_net/search",
+    _load_data=load_data,
+    _run_cv=run_cv_tabular_baseline_anomaly,
+    _make_model=make_model,
+) -> tuple[pd.DataFrame, dict]:
+    cfg0 = phase3_default_config()
+    cfg0.update(base_config)
+    train_df, _ = _load_data(Path(cfg0["train_path"]), Path(cfg0["test_path"]), max_series=cfg0.get("max_series"))
+
+    rows: list[dict] = []
+    best_cfg: dict | None = None
+    best_wmae = float("inf")
+
+    for idx, cand in enumerate(search_space, start=1):
+        cfg = {**cfg0, **cand}
+        metrics_df, _ = _run_cv(
+            train_df,
+            model_builder=lambda: _make_model(float(cfg["alpha"]), float(cfg["l1_ratio"]), int(cfg["max_iter"])),
+            n_folds=int(cfg["n_folds"]),
+            val_weeks=int(cfg["val_weeks"]),
+            lag_orders=LAG_ORDERS,
+            feature_cols=ANOM_FEATURE_COLS,
+        )
+        mean_row = mean_row_from_metrics(metrics_df)
+        wmae_val = float(mean_row["wmae"])
+        rows.append(
+            {
+                "candidate": idx,
+                **cand,
+                "wmae": wmae_val,
+                "mae": float(mean_row.get("mae", np.nan)),
+                "rmse": float(mean_row.get("rmse", np.nan)),
+            }
+        )
+        if wmae_val < best_wmae:
+            best_wmae = wmae_val
+            best_cfg = cfg
+
+    results_df = pd.DataFrame(rows).sort_values("wmae").reset_index(drop=True)
+    out_dir = Path(search_output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(out_dir / "search_results.csv", index=False)
+    if best_cfg is None:
+        raise RuntimeError("Phase 3 tuning did not evaluate any candidates")
+    (out_dir / "best_config.json").write_text(json.dumps(best_cfg, indent=2), encoding="utf-8")
+    return results_df, best_cfg
 ```
 
-### Phase 3 Run
-
+### Phase 4 Core Definitions
 ```{python}
 #| eval: false
 
-run_with_argv(phase3_main, ["phase3_elastic_net"])
-```
-
-### Phase 4 Definitions
-
-```{python}
-#| eval: false
-from __future__ import annotations
-
-import argparse
 import json
 from pathlib import Path
 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Phase 4: Random Forest anomaly baseline with recursive forward-chaining evaluation."
-    )
-    parser.add_argument("--train-path", default="train_feat.parquet")
-    parser.add_argument("--test-path", default="test_feat.parquet")
-    parser.add_argument("--output-dir", default="outputs/baselines/random_forest")
-    parser.add_argument("--n-folds", type=int, default=4)
-    parser.add_argument("--val-weeks", type=int, default=13)
-    parser.add_argument("--max-series", type=int, default=None)
-
-    parser.add_argument("--n-estimators", type=int, default=120)
-    parser.add_argument("--max-depth", type=int, default=18)
-    parser.add_argument("--min-samples-leaf", type=int, default=2)
-    parser.add_argument("--max-features", default="sqrt")
-    return parser.parse_args()
-
 
 def make_model(n_estimators: int, max_depth: int, min_samples_leaf: int, max_features: str):
     return Pipeline(
@@ -1837,94 +1906,143 @@ def make_model(n_estimators: int, max_depth: int, min_samples_leaf: int, max_fea
     )
 
 
-def main() -> None:
-    args = parse_args()
-    output_dir = ensure_output_dir(Path(args.output_dir))
+def phase4_default_config() -> dict:
+    return {
+        "train_path": "train_feat.parquet",
+        "test_path": "test_feat.parquet",
+        "output_dir": "outputs/baselines/random_forest",
+        "n_folds": 4,
+        "val_weeks": 13,
+        "max_series": None,
+        "n_estimators": 120,
+        "max_depth": 18,
+        "min_samples_leaf": 2,
+        "max_features": "sqrt",
+    }
 
-    print("Loading data...")
-    train_df, test_df = load_data(Path(args.train_path), Path(args.test_path), max_series=args.max_series)
-    print(
-        f"train rows={train_df.shape[0]}, test rows={test_df.shape[0]}, "
-        f"train series={train_df['series_id'].nunique()}, test series={test_df['series_id'].nunique()}"
-    )
 
-    print("\nRunning recursive forward-chaining CV...")
-    metrics_df, oof_df = run_cv_tabular_baseline_anomaly(
+def run_phase4(
+    config: dict | None = None,
+    _ensure_output_dir=ensure_output_dir,
+    _load_data=load_data,
+    _run_cv=run_cv_tabular_baseline_anomaly,
+    _fit_full=fit_full_train_and_predict_test_tabular_anomaly,
+    _make_model=make_model,
+) -> dict[str, Path]:
+    cfg = phase4_default_config()
+    if config:
+        cfg.update(config)
+
+    out_dir = _ensure_output_dir(Path(cfg["output_dir"]))
+    train_df, test_df = _load_data(Path(cfg["train_path"]), Path(cfg["test_path"]), max_series=cfg.get("max_series"))
+
+    metrics_df, oof_df = _run_cv(
         train_df,
-        model_builder=lambda: make_model(
-            args.n_estimators,
-            args.max_depth,
-            args.min_samples_leaf,
-            args.max_features,
+        model_builder=lambda: _make_model(
+            int(cfg["n_estimators"]),
+            int(cfg["max_depth"]),
+            int(cfg["min_samples_leaf"]),
+            str(cfg["max_features"]),
         ),
-        n_folds=args.n_folds,
-        val_weeks=args.val_weeks,
+        n_folds=int(cfg["n_folds"]),
+        val_weeks=int(cfg["val_weeks"]),
         lag_orders=LAG_ORDERS,
         feature_cols=ANOM_FEATURE_COLS,
     )
 
-    metrics_path = output_dir / "metrics.csv"
+    metrics_path = out_dir / "metrics.csv"
+    oof_path = out_dir / "oof.parquet"
     metrics_df.to_csv(metrics_path, index=False)
-    print(f"Saved metrics -> {metrics_path}")
-
-    oof_path = output_dir / "oof.parquet"
     oof_df.to_parquet(oof_path, index=False)
-    print(f"Saved OOF predictions -> {oof_path}")
 
-    print("\nFitting full train and forecasting test recursively...")
-    test_pred = fit_full_train_and_predict_test_tabular_anomaly(
+    test_pred = _fit_full(
         train_df,
         test_df,
-        model_builder=lambda: make_model(
-            args.n_estimators,
-            args.max_depth,
-            args.min_samples_leaf,
-            args.max_features,
+        model_builder=lambda: _make_model(
+            int(cfg["n_estimators"]),
+            int(cfg["max_depth"]),
+            int(cfg["min_samples_leaf"]),
+            str(cfg["max_features"]),
         ),
         lag_orders=LAG_ORDERS,
         feature_cols=ANOM_FEATURE_COLS,
     )
-    test_path = output_dir / "test.parquet"
+    test_path = out_dir / "test.parquet"
     test_pred.to_parquet(test_path, index=False)
-    print(f"Saved test predictions -> {test_path}")
 
-    config = {
+    config_payload = {
+        **cfg,
         "model": "random_forest",
         "target": "sales_anom",
         "features": ANOM_FEATURE_COLS,
         "lags": list(LAG_ORDERS),
-        "n_estimators": args.n_estimators,
-        "max_depth": args.max_depth,
-        "min_samples_leaf": args.min_samples_leaf,
-        "max_features": args.max_features,
-        "n_folds": args.n_folds,
-        "val_weeks": args.val_weeks,
-        "max_series": args.max_series,
-        "train_path": args.train_path,
-        "test_path": args.test_path,
     }
-    config_path = output_dir / "config.json"
-    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-    print(f"Saved config -> {config_path}")
+    config_path = out_dir / "config.json"
+    config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
 
-phase4_main = main
+    return {"metrics": metrics_path, "oof": oof_path, "test": test_path, "config": config_path}
+
+
+def tune_phase4(
+    base_config: dict,
+    search_space: list[dict],
+    search_output_dir: str = "outputs/baselines/random_forest/search",
+    _load_data=load_data,
+    _run_cv=run_cv_tabular_baseline_anomaly,
+    _make_model=make_model,
+) -> tuple[pd.DataFrame, dict]:
+    cfg0 = phase4_default_config()
+    cfg0.update(base_config)
+    train_df, _ = _load_data(Path(cfg0["train_path"]), Path(cfg0["test_path"]), max_series=cfg0.get("max_series"))
+
+    rows: list[dict] = []
+    best_cfg: dict | None = None
+    best_wmae = float("inf")
+
+    for idx, cand in enumerate(search_space, start=1):
+        cfg = {**cfg0, **cand}
+        metrics_df, _ = _run_cv(
+            train_df,
+            model_builder=lambda: _make_model(
+                int(cfg["n_estimators"]),
+                int(cfg["max_depth"]),
+                int(cfg["min_samples_leaf"]),
+                str(cfg["max_features"]),
+            ),
+            n_folds=int(cfg["n_folds"]),
+            val_weeks=int(cfg["val_weeks"]),
+            lag_orders=LAG_ORDERS,
+            feature_cols=ANOM_FEATURE_COLS,
+        )
+        mean_row = mean_row_from_metrics(metrics_df)
+        wmae_val = float(mean_row["wmae"])
+        rows.append(
+            {
+                "candidate": idx,
+                **cand,
+                "wmae": wmae_val,
+                "mae": float(mean_row.get("mae", np.nan)),
+                "rmse": float(mean_row.get("rmse", np.nan)),
+            }
+        )
+        if wmae_val < best_wmae:
+            best_wmae = wmae_val
+            best_cfg = cfg
+
+    results_df = pd.DataFrame(rows).sort_values("wmae").reset_index(drop=True)
+    out_dir = Path(search_output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(out_dir / "search_results.csv", index=False)
+    if best_cfg is None:
+        raise RuntimeError("Phase 4 tuning did not evaluate any candidates")
+    (out_dir / "best_config.json").write_text(json.dumps(best_cfg, indent=2), encoding="utf-8")
+    return results_df, best_cfg
 ```
 
-### Phase 4 Run
-
+### Phase 5 Core Definitions
 ```{python}
 #| eval: false
 
-run_with_argv(phase4_main, ["phase4_random_forest"])
-```
-
-### Phase 5 Definitions
-
-```{python}
-#| eval: false
-from __future__ import annotations
-
-import argparse
 import json
 import time
 import warnings
@@ -1939,7 +2057,6 @@ from sklearn.preprocessing import StandardScaler
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
-
 EXOG_FEATURE_COLS = [
     "temp_anom",
     "fuel_anom",
@@ -1952,22 +2069,6 @@ EXOG_FEATURE_COLS = [
     "Unemployment",
 ]
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Phase 5: ETS anomaly baseline with forward-chaining validation."
-    )
-    parser.add_argument("--train-path", default="train_feat.parquet")
-    parser.add_argument("--test-path", default="test_feat.parquet")
-    parser.add_argument("--output-dir", default="outputs/baselines/ets")
-    parser.add_argument("--n-folds", type=int, default=4)
-    parser.add_argument("--val-weeks", type=int, default=13)
-    parser.add_argument("--max-series", type=int, default=None)
-    parser.add_argument("--seasonal-periods", type=int, default=52)
-    parser.add_argument("--exog-alpha", type=float, default=1.0)
-    return parser.parse_args()
-
-
 def make_exog_model(alpha: float) -> Pipeline:
     return Pipeline(
         steps=[
@@ -1977,14 +2078,12 @@ def make_exog_model(alpha: float) -> Pipeline:
         ]
     )
 
-
 def _safe_score(aic: float | None, sse: float | None) -> float:
     if aic is not None and np.isfinite(aic):
         return float(aic)
     if sse is not None and np.isfinite(sse):
         return float(sse)
     return float("inf")
-
 
 def forecast_ets_with_fallback(
     train_values: np.ndarray,
@@ -2043,7 +2142,6 @@ def forecast_ets_with_fallback(
     if best_forecast is None:
         return np.full(horizon, float(y[-1]), dtype=float), "last-value-fallback"
     return best_forecast, best_tag
-
 
 def run_cv(
     train_df: pd.DataFrame,
@@ -2142,7 +2240,6 @@ def run_cv(
     oof_df = pd.concat(oof_parts, ignore_index=True) if oof_parts else pd.DataFrame()
     return metrics_df, oof_df, mode_counts
 
-
 def fit_full_and_predict_test(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -2195,82 +2292,124 @@ def fit_full_and_predict_test(
     return pred_df, mode_counts
 
 
-def main() -> None:
-    args = parse_args()
+def phase5_default_config() -> dict:
+    return {
+        "train_path": "train_feat.parquet",
+        "test_path": "test_feat.parquet",
+        "output_dir": "outputs/baselines/ets",
+        "n_folds": 4,
+        "val_weeks": 13,
+        "max_series": None,
+        "seasonal_periods": 52,
+        "exog_alpha": 1.0,
+    }
+
+
+def run_phase5(
+    config: dict | None = None,
+    _ensure_output_dir=ensure_output_dir,
+    _load_data=load_data,
+    _run_cv_phase5=run_cv,
+    _fit_full_phase5=fit_full_and_predict_test,
+) -> dict[str, Path]:
+    cfg = phase5_default_config()
+    if config:
+        cfg.update(config)
+
     warnings.filterwarnings("ignore", category=ConvergenceWarning)
-    output_dir = ensure_output_dir(Path(args.output_dir))
+    out_dir = _ensure_output_dir(Path(cfg["output_dir"]))
+    train_df, test_df = _load_data(Path(cfg["train_path"]), Path(cfg["test_path"]), max_series=cfg.get("max_series"))
 
-    print("Loading data...")
-    train_df, test_df = load_data(Path(args.train_path), Path(args.test_path), max_series=args.max_series)
-    print(
-        f"train rows={train_df.shape[0]}, test rows={test_df.shape[0]}, "
-        f"train series={train_df['series_id'].nunique()}, test series={test_df['series_id'].nunique()}"
-    )
-
-    print("\nRunning forward-chaining CV...")
-    metrics_df, oof_df, cv_mode_counts = run_cv(
+    metrics_df, oof_df, cv_mode_counts = _run_cv_phase5(
         train_df=train_df,
-        n_folds=args.n_folds,
-        val_weeks=args.val_weeks,
-        seasonal_periods=args.seasonal_periods,
-        exog_alpha=args.exog_alpha,
+        n_folds=int(cfg["n_folds"]),
+        val_weeks=int(cfg["val_weeks"]),
+        seasonal_periods=int(cfg["seasonal_periods"]),
+        exog_alpha=float(cfg["exog_alpha"]),
     )
 
-    metrics_path = output_dir / "metrics.csv"
+    metrics_path = out_dir / "metrics.csv"
+    oof_path = out_dir / "oof.parquet"
     metrics_df.to_csv(metrics_path, index=False)
-    print(f"Saved metrics -> {metrics_path}")
-
-    oof_path = output_dir / "oof.parquet"
     oof_df.to_parquet(oof_path, index=False)
-    print(f"Saved OOF predictions -> {oof_path}")
 
-    print("\nFitting full train and forecasting test...")
-    test_pred, test_mode_counts = fit_full_and_predict_test(
+    test_pred, test_mode_counts = _fit_full_phase5(
         train_df=train_df,
         test_df=test_df,
-        seasonal_periods=args.seasonal_periods,
-        exog_alpha=args.exog_alpha,
+        seasonal_periods=int(cfg["seasonal_periods"]),
+        exog_alpha=float(cfg["exog_alpha"]),
     )
-    test_path = output_dir / "test.parquet"
+    test_path = out_dir / "test.parquet"
     test_pred.to_parquet(test_path, index=False)
-    print(f"Saved test predictions -> {test_path}")
 
-    config = {
+    config_payload = {
+        **cfg,
         "model": "ets",
         "target": "sales_anom (via exogenous + ETS residual)",
-        "seasonal_periods": args.seasonal_periods,
         "exogenous_features": EXOG_FEATURE_COLS,
-        "exog_alpha": args.exog_alpha,
-        "n_folds": args.n_folds,
-        "val_weeks": args.val_weeks,
-        "max_series": args.max_series,
         "cv_mode_counts": cv_mode_counts,
         "test_mode_counts": test_mode_counts,
-        "train_path": args.train_path,
-        "test_path": args.test_path,
     }
-    config_path = output_dir / "config.json"
-    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-    print(f"Saved config -> {config_path}")
+    config_path = out_dir / "config.json"
+    config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
 
-phase5_main = main
+    return {"metrics": metrics_path, "oof": oof_path, "test": test_path, "config": config_path}
+
+
+def tune_phase5(
+    base_config: dict,
+    search_space: list[dict],
+    search_output_dir: str = "outputs/baselines/ets/search",
+    _load_data=load_data,
+    _run_cv_phase5=run_cv,
+) -> tuple[pd.DataFrame, dict]:
+    cfg0 = phase5_default_config()
+    cfg0.update(base_config)
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+    train_df, _ = _load_data(Path(cfg0["train_path"]), Path(cfg0["test_path"]), max_series=cfg0.get("max_series"))
+
+    rows: list[dict] = []
+    best_cfg: dict | None = None
+    best_wmae = float("inf")
+
+    for idx, cand in enumerate(search_space, start=1):
+        cfg = {**cfg0, **cand}
+        metrics_df, _, _ = _run_cv_phase5(
+            train_df=train_df,
+            n_folds=int(cfg["n_folds"]),
+            val_weeks=int(cfg["val_weeks"]),
+            seasonal_periods=int(cfg["seasonal_periods"]),
+            exog_alpha=float(cfg["exog_alpha"]),
+        )
+        mean_row = mean_row_from_metrics(metrics_df)
+        wmae_val = float(mean_row["wmae"])
+        rows.append(
+            {
+                "candidate": idx,
+                **cand,
+                "wmae": wmae_val,
+                "mae": float(mean_row.get("mae", np.nan)),
+                "rmse": float(mean_row.get("rmse", np.nan)),
+            }
+        )
+        if wmae_val < best_wmae:
+            best_wmae = wmae_val
+            best_cfg = cfg
+
+    results_df = pd.DataFrame(rows).sort_values("wmae").reset_index(drop=True)
+    out_dir = Path(search_output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(out_dir / "search_results.csv", index=False)
+    if best_cfg is None:
+        raise RuntimeError("Phase 5 tuning did not evaluate any candidates")
+    (out_dir / "best_config.json").write_text(json.dumps(best_cfg, indent=2), encoding="utf-8")
+    return results_df, best_cfg
 ```
 
-### Phase 5 Run
-
+### Phase 6 Core Definitions
 ```{python}
 #| eval: false
 
-run_with_argv(phase5_main, ["phase5_ets"])
-```
-
-### Phase 6 Definitions
-
-```{python}
-#| eval: false
-from __future__ import annotations
-
-import argparse
 import json
 from pathlib import Path
 
@@ -2278,26 +2417,6 @@ from sklearn.ensemble import AdaBoostRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.tree import DecisionTreeRegressor
-
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Phase 7: AdaBoost anomaly baseline with recursive forward-chaining evaluation."
-    )
-    parser.add_argument("--train-path", default="train_feat.parquet")
-    parser.add_argument("--test-path", default="test_feat.parquet")
-    parser.add_argument("--output-dir", default="outputs/baselines/adaboost")
-    parser.add_argument("--n-folds", type=int, default=4)
-    parser.add_argument("--val-weeks", type=int, default=13)
-    parser.add_argument("--max-series", type=int, default=None)
-
-    parser.add_argument("--n-estimators", type=int, default=300)
-    parser.add_argument("--learning-rate", type=float, default=0.03)
-    parser.add_argument("--max-depth", type=int, default=3)
-    parser.add_argument("--loss", default="linear", choices=["linear", "square", "exponential"])
-    return parser.parse_args()
-
 
 def make_model(
     n_estimators: int,
@@ -2333,85 +2452,321 @@ def make_model(
     )
 
 
-def main() -> None:
-    args = parse_args()
-    output_dir = ensure_output_dir(Path(args.output_dir))
+def phase6_default_config() -> dict:
+    return {
+        "train_path": "train_feat.parquet",
+        "test_path": "test_feat.parquet",
+        "output_dir": "outputs/baselines/adaboost",
+        "n_folds": 4,
+        "val_weeks": 13,
+        "max_series": None,
+        "n_estimators": 300,
+        "learning_rate": 0.03,
+        "max_depth": 3,
+        "loss": "linear",
+    }
 
-    print("Loading data...")
-    train_df, test_df = load_data(Path(args.train_path), Path(args.test_path), max_series=args.max_series)
-    print(
-        f"train rows={train_df.shape[0]}, test rows={test_df.shape[0]}, "
-        f"train series={train_df['series_id'].nunique()}, test series={test_df['series_id'].nunique()}"
-    )
 
-    print("\nRunning recursive forward-chaining CV...")
-    metrics_df, oof_df = run_cv_tabular_baseline_anomaly(
+def run_phase6(
+    config: dict | None = None,
+    _ensure_output_dir=ensure_output_dir,
+    _load_data=load_data,
+    _run_cv=run_cv_tabular_baseline_anomaly,
+    _fit_full=fit_full_train_and_predict_test_tabular_anomaly,
+    _make_model=make_model,
+) -> dict[str, Path]:
+    cfg = phase6_default_config()
+    if config:
+        cfg.update(config)
+
+    out_dir = _ensure_output_dir(Path(cfg["output_dir"]))
+    train_df, test_df = _load_data(Path(cfg["train_path"]), Path(cfg["test_path"]), max_series=cfg.get("max_series"))
+
+    metrics_df, oof_df = _run_cv(
         train_df,
-        model_builder=lambda: make_model(
-            args.n_estimators,
-            args.learning_rate,
-            args.max_depth,
-            args.loss,
+        model_builder=lambda: _make_model(
+            int(cfg["n_estimators"]),
+            float(cfg["learning_rate"]),
+            int(cfg["max_depth"]),
+            str(cfg["loss"]),
         ),
-        n_folds=args.n_folds,
-        val_weeks=args.val_weeks,
+        n_folds=int(cfg["n_folds"]),
+        val_weeks=int(cfg["val_weeks"]),
         lag_orders=LAG_ORDERS,
         feature_cols=ANOM_FEATURE_COLS,
     )
 
-    metrics_path = output_dir / "metrics.csv"
+    metrics_path = out_dir / "metrics.csv"
+    oof_path = out_dir / "oof.parquet"
     metrics_df.to_csv(metrics_path, index=False)
-    print(f"Saved metrics -> {metrics_path}")
-
-    oof_path = output_dir / "oof.parquet"
     oof_df.to_parquet(oof_path, index=False)
-    print(f"Saved OOF predictions -> {oof_path}")
 
-    print("\nFitting full train and forecasting test recursively...")
-    test_pred = fit_full_train_and_predict_test_tabular_anomaly(
+    test_pred = _fit_full(
         train_df,
         test_df,
-        model_builder=lambda: make_model(
-            args.n_estimators,
-            args.learning_rate,
-            args.max_depth,
-            args.loss,
+        model_builder=lambda: _make_model(
+            int(cfg["n_estimators"]),
+            float(cfg["learning_rate"]),
+            int(cfg["max_depth"]),
+            str(cfg["loss"]),
         ),
         lag_orders=LAG_ORDERS,
         feature_cols=ANOM_FEATURE_COLS,
     )
-    test_path = output_dir / "test.parquet"
+    test_path = out_dir / "test.parquet"
     test_pred.to_parquet(test_path, index=False)
-    print(f"Saved test predictions -> {test_path}")
 
-    config = {
+    config_payload = {
+        **cfg,
         "model": "adaboost",
         "target": "sales_anom",
         "features": ANOM_FEATURE_COLS,
         "lags": list(LAG_ORDERS),
-        "n_estimators": args.n_estimators,
-        "learning_rate": args.learning_rate,
-        "max_depth": args.max_depth,
-        "loss": args.loss,
-        "n_folds": args.n_folds,
-        "val_weeks": args.val_weeks,
-        "max_series": args.max_series,
-        "train_path": args.train_path,
-        "test_path": args.test_path,
     }
-    config_path = output_dir / "config.json"
-    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-    print(f"Saved config -> {config_path}")
+    config_path = out_dir / "config.json"
+    config_path.write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
 
-phase6_main = main
+    return {"metrics": metrics_path, "oof": oof_path, "test": test_path, "config": config_path}
+
+
+def tune_phase6(
+    base_config: dict,
+    search_space: list[dict],
+    search_output_dir: str = "outputs/baselines/adaboost/search",
+    _load_data=load_data,
+    _run_cv=run_cv_tabular_baseline_anomaly,
+    _make_model=make_model,
+) -> tuple[pd.DataFrame, dict]:
+    cfg0 = phase6_default_config()
+    cfg0.update(base_config)
+    train_df, _ = _load_data(Path(cfg0["train_path"]), Path(cfg0["test_path"]), max_series=cfg0.get("max_series"))
+
+    rows: list[dict] = []
+    best_cfg: dict | None = None
+    best_wmae = float("inf")
+
+    for idx, cand in enumerate(search_space, start=1):
+        cfg = {**cfg0, **cand}
+        metrics_df, _ = _run_cv(
+            train_df,
+            model_builder=lambda: _make_model(
+                int(cfg["n_estimators"]),
+                float(cfg["learning_rate"]),
+                int(cfg["max_depth"]),
+                str(cfg["loss"]),
+            ),
+            n_folds=int(cfg["n_folds"]),
+            val_weeks=int(cfg["val_weeks"]),
+            lag_orders=LAG_ORDERS,
+            feature_cols=ANOM_FEATURE_COLS,
+        )
+        mean_row = mean_row_from_metrics(metrics_df)
+        wmae_val = float(mean_row["wmae"])
+        rows.append(
+            {
+                "candidate": idx,
+                **cand,
+                "wmae": wmae_val,
+                "mae": float(mean_row.get("mae", np.nan)),
+                "rmse": float(mean_row.get("rmse", np.nan)),
+            }
+        )
+        if wmae_val < best_wmae:
+            best_wmae = wmae_val
+            best_cfg = cfg
+
+    results_df = pd.DataFrame(rows).sort_values("wmae").reset_index(drop=True)
+    out_dir = Path(search_output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(out_dir / "search_results.csv", index=False)
+    if best_cfg is None:
+        raise RuntimeError("Phase 6 tuning did not evaluate any candidates")
+    (out_dir / "best_config.json").write_text(json.dumps(best_cfg, indent=2), encoding="utf-8")
+    return results_df, best_cfg
 ```
 
-### Phase 6 Run
+### Phase 1 Config and Tuning
+```{python}
+#| eval: false
+
+
+PHASE1_CFG = phase1_default_config()
+PHASE1_SEARCH = [
+    {"kernel": "tricube", "bandwidth": 4, "ridge": 1e-4, "coef_clip": 6.0},
+    {"kernel": "tricube", "bandwidth": 6, "ridge": 1e-4, "coef_clip": 6.0},
+    {"kernel": "tricube", "bandwidth": 8, "ridge": 5e-4, "coef_clip": 5.0},
+    {"kernel": "exponential", "bandwidth": 6, "ridge": 1e-4, "coef_clip": 6.0},
+]
+```
 
 ```{python}
 #| eval: false
 
-run_with_argv(phase6_main, ["phase6_adaboost"])
+PHASE1_RESULTS, PHASE1_BEST_CFG = tune_phase1(PHASE1_CFG, PHASE1_SEARCH)
+```
+
+```{python}
+#| eval: false
+
+phase1_artifacts = run_phase1(PHASE1_BEST_CFG)
+phase1_artifacts
+```
+
+### Phase 1-lite Config and Run
+```{python}
+#| eval: false
+
+
+PHASE1_LITE_CFG = phase1_default_config()
+PHASE1_LITE_CFG.update(
+    {
+        "output_dir": "outputs/phase1_local_linear_lite",
+        "feature_mode": "lite",
+        "use_interactions": False,
+    }
+)
+```
+
+```{python}
+#| eval: false
+
+phase1_lite_artifacts = run_phase1(PHASE1_LITE_CFG)
+phase1_lite_artifacts
+```
+
+### Phase 2 Config and Tuning
+```{python}
+#| eval: false
+
+
+PHASE2_CFG = phase2_default_config()
+PHASE2_SEARCH = [
+    {"fourier_order": 2, "max_eval": 1200, "pred_draws": 20},
+    {"fourier_order": 3, "max_eval": 1800, "pred_draws": 40},
+    {"fourier_order": 4, "max_eval": 1800, "pred_draws": 40},
+]
+PHASE2_TUNE_OVERRIDES = {
+    "n_folds": 2,
+    "val_weeks": 8,
+    "max_series": 600,
+}
+```
+
+```{python}
+#| eval: false
+
+PHASE2_RESULTS, PHASE2_BEST_CFG = tune_phase2(PHASE2_CFG, PHASE2_SEARCH, tune_overrides=PHASE2_TUNE_OVERRIDES)
+```
+
+```{python}
+#| eval: false
+
+phase2_artifacts = run_phase2(PHASE2_BEST_CFG)
+phase2_artifacts
+```
+
+### Phase 3 Config and Tuning
+```{python}
+#| eval: false
+
+
+PHASE3_CFG = phase3_default_config()
+PHASE3_SEARCH = [
+    {"alpha": 0.01, "l1_ratio": 0.1},
+    {"alpha": 0.02, "l1_ratio": 0.2},
+    {"alpha": 0.05, "l1_ratio": 0.3},
+]
+```
+
+```{python}
+#| eval: false
+
+PHASE3_RESULTS, PHASE3_BEST_CFG = tune_phase3(PHASE3_CFG, PHASE3_SEARCH)
+```
+
+```{python}
+#| eval: false
+
+phase3_artifacts = run_phase3(PHASE3_BEST_CFG)
+phase3_artifacts
+```
+
+### Phase 4 Config and Tuning
+```{python}
+#| eval: false
+
+
+PHASE4_CFG = phase4_default_config()
+PHASE4_SEARCH = [
+    {"n_estimators": 80, "max_depth": 14, "min_samples_leaf": 2, "max_features": "sqrt"},
+    {"n_estimators": 120, "max_depth": 18, "min_samples_leaf": 2, "max_features": "sqrt"},
+    {"n_estimators": 160, "max_depth": 22, "min_samples_leaf": 1, "max_features": "sqrt"},
+]
+```
+
+```{python}
+#| eval: false
+
+PHASE4_RESULTS, PHASE4_BEST_CFG = tune_phase4(PHASE4_CFG, PHASE4_SEARCH)
+```
+
+```{python}
+#| eval: false
+
+phase4_artifacts = run_phase4(PHASE4_BEST_CFG)
+phase4_artifacts
+```
+
+### Phase 5 Config and Tuning
+```{python}
+#| eval: false
+
+
+PHASE5_CFG = phase5_default_config()
+PHASE5_SEARCH = [
+    {"seasonal_periods": 52, "exog_alpha": 0.5},
+    {"seasonal_periods": 52, "exog_alpha": 1.0},
+    {"seasonal_periods": 53, "exog_alpha": 1.0},
+]
+```
+
+```{python}
+#| eval: false
+
+PHASE5_RESULTS, PHASE5_BEST_CFG = tune_phase5(PHASE5_CFG, PHASE5_SEARCH)
+```
+
+```{python}
+#| eval: false
+
+phase5_artifacts = run_phase5(PHASE5_BEST_CFG)
+phase5_artifacts
+```
+
+### Phase 6 Config and Tuning
+```{python}
+#| eval: false
+
+
+PHASE6_CFG = phase6_default_config()
+PHASE6_SEARCH = [
+    {"n_estimators": 200, "learning_rate": 0.03, "max_depth": 2, "loss": "linear"},
+    {"n_estimators": 300, "learning_rate": 0.03, "max_depth": 3, "loss": "linear"},
+    {"n_estimators": 400, "learning_rate": 0.02, "max_depth": 3, "loss": "square"},
+]
+```
+
+```{python}
+#| eval: false
+
+PHASE6_RESULTS, PHASE6_BEST_CFG = tune_phase6(PHASE6_CFG, PHASE6_SEARCH)
+```
+
+```{python}
+#| eval: false
+
+phase6_artifacts = run_phase6(PHASE6_BEST_CFG)
+phase6_artifacts
 ```
 
 ## Data and Evaluation Setup
