@@ -1,0 +1,35 @@
+Structural AR Fold Comparison: MAP vs NUTS
+timestamp_seed=8927
+
+Data setup
+max_series=200
+fold_id=1
+train_start=2010-02-05
+train_end=2011-10-28
+val_start=2011-11-04
+val_end=2012-01-27
+train_rows=16378
+val_rows=2421
+fourier_order=3
+
+Inference setup
+map_maxeval=2500
+nuts_sampler=pymc
+chains=2
+draws=300
+tune=300
+target_accept=0.9
+posterior_draw_preds=60
+
+Diagnostics
+nuts_runtime_sec=72.957
+map_runtime_sec=4.103
+divergences=0
+rhat_max=1.0100
+ess_bulk_min=327.00
+
+Metrics
+       wmae         mae        rmse           method  runtime_sec
+3303.902091 3019.287981 6781.881980              map     4.102708
+3304.054593 3020.052337 6776.905814 nuts_mean_params    72.957036
+3306.566200 3021.911751 6777.301050   nuts_draw_mean    72.957036

@@ -1,0 +1,739 @@
+---
+title: "Walmart Weekly Sales Forecasting: Model Comparison"
+author: "Machine Learning UTEC Homework"
+format:
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+lightbox: true
+---
+
+## Objective
+
+This report compares six forecasting approaches for weekly Walmart sales:
+
+1. Local Linear Anomaly Model (Phase 1).
+2. Bayesian Structural AR (Phase 2, full data).
+3. Elastic Net anomaly baseline (Phase 3).
+4. Random Forest anomaly baseline (Phase 4).
+5. ETS anomaly baseline (Phase 5).
+6. AdaBoost anomaly baseline (Phase 7).
+
+Additionally, we include a `Phase 1-lite` diagnostic variant in the final comparison to show the impact of removing the extra exogenous variables from Local Linear.
+
+Evaluation uses forward-chaining validation and weighted MAE (WMAE).
+
+## Data and Evaluation Setup
+
+```{python}
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+PANTONE_GREEN = "#00A651"   # Pantone-style green (approx RGB equivalent)
+PANTONE_ORANGE = "#FF6A13"  # Pantone-style orange (approx RGB equivalent)
+
+def find_project_root() -> Path:
+    candidates = [Path("."), Path(".."), Path("../..")]
+    for c in candidates:
+        if (c / "outputs" / "metrics" / "local_linear_cv.csv").exists():
+            return c.resolve()
+    raise FileNotFoundError("Could not locate project root with outputs/metrics/local_linear_cv.csv")
+
+def split_fold_and_mean(cv_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    fold = cv_df[cv_df["fold"].astype(str) != "mean"].copy()
+    mean = cv_df[cv_df["fold"].astype(str) == "mean"].iloc[0]
+    return fold, mean
+
+def weekly_actual_vs_pred(oof_df: pd.DataFrame) -> pd.DataFrame:
+    agg_map: dict[str, tuple[str, str]] = {
+        "actual_sales": ("Weekly_Sales", "sum"),
+        "pred_sales": ("pred_sales", "sum"),
+    }
+    if {"pred_sales_lower", "pred_sales_upper"}.issubset(oof_df.columns):
+        agg_map["pred_lower"] = ("pred_sales_lower", "sum")
+        agg_map["pred_upper"] = ("pred_sales_upper", "sum")
+    out = oof_df.groupby("Date", as_index=False).agg(**agg_map).sort_values("Date")
+    return out
+
+def plot_weekly_actual_vs_pred(
+    oof_df: pd.DataFrame,
+    title: str,
+    pred_color: str = PANTONE_ORANGE,
+    show_uncertainty: bool = False,
+) -> None:
+    weekly = weekly_actual_vs_pred(oof_df)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(weekly["Date"], weekly["actual_sales"], color=PANTONE_GREEN, linewidth=2, label="Actual sales")
+    ax.plot(weekly["Date"], weekly["pred_sales"], color=pred_color, linewidth=2, label="Predicted sales")
+    if show_uncertainty and {"pred_lower", "pred_upper"}.issubset(weekly.columns):
+        ax.fill_between(
+            weekly["Date"],
+            weekly["pred_lower"],
+            weekly["pred_upper"],
+            color=pred_color,
+            alpha=0.2,
+            label="Predictive interval",
+        )
+    ax.set_title(title)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Aggregated Weekly Sales")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    plt.show()
+
+def make_param_df(entries: list[tuple[str, object, str]]) -> pd.DataFrame:
+    return pd.DataFrame(entries, columns=["Parameter", "Value", "How it works"])
+
+ROOT = find_project_root()
+OUTPUTS = ROOT / "outputs"
+BASELINES = OUTPUTS / "baselines"
+
+# Phase 1 (full data)
+p1_cv = pd.read_csv(OUTPUTS / "metrics" / "local_linear_cv.csv")
+p1_oof = pd.read_parquet(OUTPUTS / "preds" / "local_linear_oof.parquet")
+p1_cfg = json.loads((OUTPUTS / "metrics" / "local_linear_config.json").read_text(encoding="utf-8"))
+p1_lite_cv = pd.read_csv(OUTPUTS / "phase1_local_linear_lite" / "metrics" / "local_linear_cv.csv")
+p1_lite_oof = pd.read_parquet(OUTPUTS / "phase1_local_linear_lite" / "preds" / "local_linear_oof.parquet")
+p1_lite_cfg = json.loads(
+    (OUTPUTS / "phase1_local_linear_lite" / "metrics" / "local_linear_config.json").read_text(encoding="utf-8")
+)
+grid_results = pd.read_csv(OUTPUTS / "search" / "local_linear_grid_results.csv")
+best_grid_cfg = json.loads((OUTPUTS / "search" / "best_local_linear_config.json").read_text(encoding="utf-8"))
+
+# Phase 2 (full data)
+p2_cv = pd.read_csv(OUTPUTS / "phase2_structural_ar_full" / "metrics" / "structural_ar_cv.csv")
+p2_oof = pd.read_parquet(OUTPUTS / "phase2_structural_ar_full" / "preds" / "structural_ar_oof.parquet")
+p2_cfg = json.loads((OUTPUTS / "phase2_structural_ar_full" / "metrics" / "structural_ar_config.json").read_text(encoding="utf-8"))
+
+# Phase 3, 4, 5, 7 baselines
+en_cv = pd.read_csv(BASELINES / "elastic_net" / "metrics.csv")
+en_oof = pd.read_parquet(BASELINES / "elastic_net" / "oof.parquet")
+en_cfg = json.loads((BASELINES / "elastic_net" / "config.json").read_text(encoding="utf-8"))
+
+rf_cv = pd.read_csv(BASELINES / "random_forest" / "metrics.csv")
+rf_oof = pd.read_parquet(BASELINES / "random_forest" / "oof.parquet")
+rf_cfg = json.loads((BASELINES / "random_forest" / "config.json").read_text(encoding="utf-8"))
+
+ets_cv = pd.read_csv(BASELINES / "ets" / "metrics.csv")
+ets_oof = pd.read_parquet(BASELINES / "ets" / "oof.parquet")
+ets_cfg = json.loads((BASELINES / "ets" / "config.json").read_text(encoding="utf-8"))
+
+ad_cv = pd.read_csv(BASELINES / "adaboost" / "metrics.csv")
+ad_oof = pd.read_parquet(BASELINES / "adaboost" / "oof.parquet")
+ad_cfg = json.loads((BASELINES / "adaboost" / "config.json").read_text(encoding="utf-8"))
+
+for df in [p1_oof, p1_lite_oof, p2_oof, en_oof, rf_oof, ets_oof, ad_oof]:
+    df["Date"] = pd.to_datetime(df["Date"])
+
+p1_fold, p1_mean = split_fold_and_mean(p1_cv)
+p1_lite_fold, p1_lite_mean = split_fold_and_mean(p1_lite_cv)
+p2_fold, p2_mean = split_fold_and_mean(p2_cv)
+en_fold, en_mean = split_fold_and_mean(en_cv)
+rf_fold, rf_mean = split_fold_and_mean(rf_cv)
+ets_fold, ets_mean = split_fold_and_mean(ets_cv)
+ad_fold, ad_mean = split_fold_and_mean(ad_cv)
+
+artifact_summary = pd.DataFrame(
+    [
+        {"Artifact": "Phase 1 OOF rows", "Value": int(p1_oof.shape[0])},
+        {"Artifact": "Phase 1-lite OOF rows", "Value": int(p1_lite_oof.shape[0])},
+        {"Artifact": "Phase 2 OOF rows", "Value": int(p2_oof.shape[0])},
+        {"Artifact": "Elastic Net OOF rows", "Value": int(en_oof.shape[0])},
+        {"Artifact": "Random Forest OOF rows", "Value": int(rf_oof.shape[0])},
+        {"Artifact": "ETS OOF rows", "Value": int(ets_oof.shape[0])},
+        {"Artifact": "AdaBoost OOF rows", "Value": int(ad_oof.shape[0])},
+    ]
+)
+artifact_summary
+```
+
+Validation metric:
+
+$$
+\text{WMAE} = \frac{\sum_i w_i \lvert y_i - \hat{y}_i \rvert}{\sum_i w_i}, \quad
+w_i =
+\begin{cases}
+5, & \text{if holiday} \\
+1, & \text{otherwise}
+\end{cases}
+$$
+
+## Model 1: Local Linear Anomaly (Phase 1)
+
+Local Linear is a weighted regression that learns a different local coefficient vector for each week-of-year neighborhood and each series. It is simple and interpretable, but sensitive to feature scaling, so standardization is applied before fitting.
+
+### Mathematical Formulation
+
+For series \(s\) and target seasonal week \(w\):
+
+$$
+\hat{\beta}_{s,w}
+=
+\arg\min_{\beta}
+\sum_{i \in s}
+K_h\!\left(d(\text{week}_i,w)\right)
+\left(y_i - \beta_0 - x_i^\top \beta\right)^2
++ \lambda \|\beta\|_2^2
+$$
+
+and recursive prediction:
+
+$$
+\hat{y}^{anom}_{t,s}=\beta_0 + x_{t,s}^\top \beta,\qquad
+\hat{y}_{t,s}=\hat{y}^{anom}_{t,s}+clim_{t,s}
+$$
+
+### Plain-Language Meaning of Terms
+
+- `series s`: one specific `Store + Dept` time series.
+- `week_i` and `w`: historical week index and target seasonal week where local fitting is centered.
+- `K_h(d(.))`: a weight that gives more importance to rows close in seasonal calendar (e.g., nearby weeks of year).
+- `x_i`: the input features for a row (lags, holiday flag, exogenous variables).
+- `beta_0, beta`: intercept and coefficients learned by local weighted regression.
+- `lambda`: regularization strength that shrinks coefficients to avoid unstable fits.
+- `y^{anom}`: anomaly target (real sales minus climatology baseline).
+- `clim_{t,s}`: baseline seasonal level added back to convert anomaly prediction to sales prediction.
+
+### Workflow
+
+```{mermaid}
+flowchart LR
+  A[Read train/test parquet] --> B[Compute climatology per series/store/week]
+  B --> C[Create anomalies and lag1/lag2]
+  C --> D[Impute missing lag/exogenous values]
+  D --> E[Standard-scale Phase 1 features]
+  E --> F[Forward-chaining CV]
+  F --> G[Fit local weighted ridge by series and seasonal week]
+  G --> H[Recursive rollout on validation horizon]
+  H --> I[OOF metrics and predictions]
+  I --> J[Fit full train and forecast test]
+```
+
+### Tuned Parameters and Effect
+
+```{python}
+make_param_df(
+    [
+        ("kernel", p1_cfg["kernel"], "Kernel shape over seasonal distance; controls local weighting profile."),
+        ("bandwidth", p1_cfg["bandwidth"], "Neighborhood width in week-of-year units; larger means smoother seasonal fit."),
+        ("min_samples", p1_cfg["min_samples"], "Minimum active samples to fit a local model; guards against unstable fits."),
+        ("ridge", p1_cfg["ridge"], "L2 regularization strength in weighted regression."),
+        ("coef_clip", p1_cfg["coef_clip"], "Post-fit coefficient clipping to prevent extreme local slopes."),
+        ("anom_clip_scale", p1_cfg["anom_clip_scale"], "Prediction clipping band around anomaly quantiles for recursive stability."),
+        ("lags", p1_cfg["lags"], "Autoregressive inputs used in recursive forecasting."),
+        ("standard_scaler", p1_cfg.get("standard_scaler", True), "Feature standardization before fitting local regressions."),
+    ]
+)
+```
+
+```{python}
+p1_cfg
+```
+
+```{python}
+p1_fold[["fold", "train_start", "train_end", "val_start", "val_end", "wmae", "mae", "rmse"]]
+```
+
+```{python}
+p1_mean[["wmae", "mae", "rmse"]]
+```
+
+```{python}
+plot_weekly_actual_vs_pred(p1_oof, "Model 1: Local Linear | OOF Weekly Sales")
+```
+
+## Model 1-lite: Local Linear Diagnostic Variant
+
+`Phase 1-lite` keeps the same Local Linear method but removes the extra exogenous variables (`MarkDown1-5`, `CPI`, `Unemployment`) and uses only `temp_anom`, `fuel_anom` plus lags/holiday.
+
+```{python}
+p1_lite_cfg
+```
+
+```{python}
+p1_lite_fold[["fold", "train_start", "train_end", "val_start", "val_end", "wmae", "mae", "rmse"]]
+```
+
+```{python}
+p1_lite_mean[["wmae", "mae", "rmse"]]
+```
+
+```{python}
+plot_weekly_actual_vs_pred(p1_lite_oof, "Model 1-lite: Local Linear | OOF Weekly Sales")
+```
+
+## Model 2: Bayesian Structural AR (Phase 2)
+
+Structural AR combines hierarchical intercepts, autoregressive lags, exogenous drivers, and seasonal Fourier terms in one probabilistic model. It is designed to capture both shared structure and series-specific behavior.
+
+### Mathematical Formulation
+
+In z-score space:
+
+$$
+y^{*}_{t,s} \sim \mathcal{N}(\mu_{t,s}, \sigma)
+$$
+
+$$
+\mu_{t,s}
+=
+\alpha_s
++ \beta_{lag}^\top lag_{t,s}
++ \beta_{exog}^\top exog_{t,s}
++ \beta_h h_{t,s}
++ \beta_{tr} trend_t
++ \beta_f^\top fourier_t
+$$
+
+with hierarchical intercept:
+
+$$
+\alpha_s = \alpha_\mu + \alpha_\sigma z_s,\qquad z_s \sim \mathcal{N}(0,1)
+$$
+
+### Plain-Language Meaning of Terms
+
+- `y*_{t,s}`: normalized anomaly target for week `t` and series `s`.
+- `mu_{t,s}`: model mean prediction before adding random noise.
+- `alpha_s`: series-specific baseline level; each `Store + Dept` has its own intercept.
+- `beta_lag`, `lag_{t,s}`: coefficients and lag features that capture autoregressive behavior.
+- `beta_exog`, `exog_{t,s}`: effects of external drivers (temperature, markdown flags, CPI, unemployment, etc.).
+- `beta_h h_{t,s}`: holiday contribution.
+- `beta_tr trend_t`: long-run drift over time.
+- `beta_f fourier_t`: smooth yearly seasonal pattern via sine/cosine terms.
+- `sigma`: predictive noise level around the mean.
+
+### Workflow
+
+```{mermaid}
+flowchart LR
+  A[Read train parquet] --> B[Compute climatology]
+  B --> C[Create anomaly target and lag1/lag2]
+  C --> D[Build trend and Fourier seasonal terms]
+  D --> E[Fill exogenous NA from train medians]
+  E --> F[Standardize lag/exogenous/trend variables]
+  F --> G[Fit PyMC structural model via MAP]
+  G --> H[Recursive probabilistic rollout by date]
+  H --> I[Aggregate draws to mean/sd and intervals]
+  I --> J[CV metrics and OOF outputs]
+```
+
+### Tuned Parameters and Effect
+
+```{python}
+make_param_df(
+    [
+        ("max_eval", p2_cfg["max_eval"], "Maximum evaluations in MAP optimization; higher allows deeper convergence."),
+        ("pred_draws", p2_cfg["pred_draws"], "Number of stochastic recursive draws for predictive mean/uncertainty."),
+        ("fourier_order", p2_cfg["fourier_order"], "Number of sine/cosine seasonal harmonics."),
+        ("lag_orders", p2_cfg["lag_orders"], "Autoregressive lags used as structural predictors."),
+        ("sigma_clusters", p2_cfg["sigma_clusters"], "Number of heteroskedastic noise clusters; 0 means shared sigma."),
+        ("exogenous_features", p2_cfg.get("exogenous_features", []), "External covariates entering the structural mean."),
+    ]
+)
+```
+
+```{python}
+p2_cfg
+```
+
+```{python}
+p2_fold[["fold", "train_start", "train_end", "val_start", "val_end", "wmae", "mae", "rmse", "runtime_sec"]]
+```
+
+```{python}
+p2_mean[["wmae", "mae", "rmse", "runtime_sec"]]
+```
+
+```{python}
+plot_weekly_actual_vs_pred(
+    p2_oof,
+    "Model 2: Structural AR | OOF Weekly Sales with Predictive Uncertainty",
+    show_uncertainty=True,
+)
+```
+
+## Model 3: Elastic Net Anomaly Baseline (Phase 3)
+
+Elastic Net is a linear model with combined L1/L2 regularization. It is a robust baseline for correlated tabular features and keeps an interpretable global linear structure.
+
+### Mathematical Formulation
+
+$$
+\hat{\beta}
+=
+\arg\min_{\beta}
+\frac{1}{2n}\|y - X\beta\|_2^2
++ \alpha\left(
+\frac{1-l1\_ratio}{2}\|\beta\|_2^2
++ l1\_ratio\|\beta\|_1
+\right)
+$$
+
+### Plain-Language Meaning of Terms
+
+- `X beta`: linear combination of all features.
+- `||y - X beta||^2`: fit error term (how far predictions are from truth).
+- `alpha`: total regularization strength.
+- `l1_ratio`: balance between:
+- L1 penalty: pushes less-useful coefficients to exactly zero (feature selection behavior).
+- L2 penalty: smoothly shrinks coefficients for stability under correlated features.
+
+### Workflow
+
+```{mermaid}
+flowchart LR
+  A[Read train/test parquet] --> B[Compute climatology and anomalies]
+  B --> C[Create lag1/lag2 and calendar features]
+  C --> D[Build exogenous feature matrix]
+  D --> E[Median imputation + standard scaling]
+  E --> F[Fit Elastic Net on train folds]
+  F --> G[Recursive forecasting on validation horizon]
+  G --> H[OOF metrics and predictions]
+  H --> I[Fit full train and forecast test]
+```
+
+### Tuned Parameters and Effect
+
+```{python}
+make_param_df(
+    [
+        ("alpha", en_cfg["alpha"], "Overall regularization strength; larger values shrink coefficients more."),
+        ("l1_ratio", en_cfg["l1_ratio"], "Mix between L1 (sparsity) and L2 (stability)."),
+        ("max_iter", en_cfg["max_iter"], "Maximum coordinate-descent iterations for convergence."),
+        ("lags", en_cfg["lags"], "Lag features used in recursive setup."),
+        ("features", en_cfg["features"], "Full tabular interface for model fitting."),
+    ]
+)
+```
+
+```{python}
+en_cfg
+```
+
+```{python}
+en_fold[["fold", "train_start", "train_end", "val_start", "val_end", "wmae", "mae", "rmse", "runtime_sec"]]
+```
+
+```{python}
+en_mean[["wmae", "mae", "rmse", "runtime_sec"]]
+```
+
+```{python}
+plot_weekly_actual_vs_pred(en_oof, "Model 3: Elastic Net | OOF Weekly Sales")
+```
+
+## Model 4: Random Forest Anomaly Baseline (Phase 4)
+
+Random Forest is an ensemble of decision trees trained on bootstrap samples. It captures nonlinear interactions with little feature engineering and is robust to mixed feature scales.
+
+### Mathematical Formulation
+
+For \(B\) trees:
+
+$$
+\hat{y}(x)=\frac{1}{B}\sum_{b=1}^{B} T_b(x)
+$$
+
+where each \(T_b\) is grown on a bootstrap sample and split candidates are randomized via `max_features`.
+
+### Plain-Language Meaning of Terms
+
+- `T_b(x)`: prediction from tree `b`.
+- `B`: number of trees in the forest.
+- Final prediction is an average of trees, which reduces variance and improves robustness.
+- Bootstrap sampling means each tree sees a slightly different sampled training set.
+- Random split-feature selection (`max_features`) decorrelates trees, improving ensemble quality.
+
+### Workflow
+
+```{mermaid}
+flowchart LR
+  A[Read train/test parquet] --> B[Compute climatology and anomalies]
+  B --> C[Create lag1/lag2 + calendar + exogenous features]
+  C --> D[Median imputation]
+  D --> E[Train Random Forest on fold train]
+  E --> F[Recursive multi-step rollout on fold validation]
+  F --> G[OOF metrics and predictions]
+  G --> H[Refit on full train and forecast test]
+```
+
+### Tuned Parameters and Effect
+
+```{python}
+make_param_df(
+    [
+        ("n_estimators", rf_cfg["n_estimators"], "Number of trees; larger reduces variance but increases runtime."),
+        ("max_depth", rf_cfg["max_depth"], "Maximum tree depth; controls model complexity."),
+        ("min_samples_leaf", rf_cfg["min_samples_leaf"], "Minimum samples per leaf; regularizes tree partitions."),
+        ("max_features", rf_cfg["max_features"], "Feature subset size considered at each split."),
+        ("lags", rf_cfg["lags"], "Autoregressive lag features used recursively."),
+    ]
+)
+```
+
+```{python}
+rf_cfg
+```
+
+```{python}
+rf_fold[["fold", "train_start", "train_end", "val_start", "val_end", "wmae", "mae", "rmse", "runtime_sec"]]
+```
+
+```{python}
+rf_mean[["wmae", "mae", "rmse", "runtime_sec"]]
+```
+
+```{python}
+plot_weekly_actual_vs_pred(rf_oof, "Model 4: Random Forest | OOF Weekly Sales")
+```
+
+## Model 5: ETS Anomaly Baseline (Phase 5)
+
+ETS here is used on residual anomalies after removing an exogenous linear component. This hybrid keeps classical exponential smoothing dynamics while allowing external regressors to explain systematic variation.
+
+### Mathematical Formulation
+
+Exogenous residual decomposition:
+
+$$
+y^{anom}_{t,s}=g(x_{t,s}) + r_{t,s},\qquad g(\cdot)\text{ from Ridge regression}
+$$
+
+Residual component \(r_{t,s}\) is modeled by ETS:
+
+$$
+r_{t,s} = \ell_{t-1,s}+b_{t-1,s}+s_{t-m,s}+\varepsilon_{t,s}
+$$
+
+and final forecast:
+
+$$
+\hat{y}_{t,s}=clim_{t,s}+\hat{g}(x_{t,s})+\hat{r}_{t,s}
+$$
+
+### Plain-Language Explanation (What ETS Is)
+
+`ETS` stands for `Error`, `Trend`, `Seasonality`.
+It is a classical time-series model that keeps three internal states and updates them week by week:
+
+- `level`: the current baseline sales level for the series.
+- `trend`: the direction/slope (increasing or decreasing behavior).
+- `seasonality`: repeating seasonal pattern (here around yearly weekly cycle).
+
+In this project we first predict the anomaly using exogenous variables (`g(x)`), then ETS models the remaining residual pattern (`r`). The final prediction is:
+
+- exogenous part
+- plus ETS residual dynamics
+- plus climatology baseline to return to sales scale.
+
+### Plain-Language Meaning of Terms
+
+- `y^{anom}`: anomaly sales target.
+- `g(x)`: exogenous linear predictor (Ridge) from external variables.
+- `r_{t,s}`: residual anomaly after removing exogenous part.
+- `ell`: level state.
+- `b`: trend state.
+- `s`: seasonal state.
+- `epsilon`: random error term.
+
+### Workflow
+
+```{mermaid}
+flowchart LR
+  A[Read train/test parquet] --> B[Compute climatology and anomalies]
+  B --> C[Fit exogenous Ridge on anomaly target]
+  C --> D[Compute residual anomaly = target - exogenous prediction]
+  D --> E[Fit per-series ETS on residuals with fallback candidates]
+  E --> F[Recursive fold forecasting by series]
+  F --> G[Add exogenous component + climatology back]
+  G --> H[OOF metrics and test forecasts]
+```
+
+### Tuned Parameters and Effect
+
+```{python}
+make_param_df(
+    [
+        ("seasonal_periods", ets_cfg["seasonal_periods"], "Season length used by ETS seasonal state."),
+        ("exog_alpha", ets_cfg.get("exog_alpha", None), "Ridge penalty for exogenous linear component."),
+        ("exogenous_features", ets_cfg.get("exogenous_features", []), "Regressors used before ETS residual modeling."),
+        ("n_folds", ets_cfg["n_folds"], "Forward-chaining fold count."),
+        ("val_weeks", ets_cfg["val_weeks"], "Validation horizon length per fold."),
+    ]
+)
+```
+
+```{python}
+ets_cfg
+```
+
+```{python}
+ets_fold[["fold", "train_start", "train_end", "val_start", "val_end", "wmae", "mae", "rmse", "runtime_sec"]]
+```
+
+```{python}
+ets_mean[["wmae", "mae", "rmse", "runtime_sec"]]
+```
+
+```{python}
+plot_weekly_actual_vs_pred(ets_oof, "Model 5: ETS | OOF Weekly Sales")
+```
+
+## Model 6: AdaBoost Anomaly Baseline (Phase 7)
+
+AdaBoost builds an additive ensemble of shallow trees, where each stage focuses more on difficult residual patterns from previous stages.
+
+### Mathematical Formulation
+
+With base learners \(h_m\):
+
+$$
+F_M(x)=\sum_{m=1}^{M}\nu_m h_m(x)
+$$
+
+where stage weights depend on chosen boosting loss and learning rate. In practice here, \(h_m\) are depth-limited regression trees.
+
+### Plain-Language Meaning of Terms
+
+- `h_m(x)`: base learner at stage `m` (small regression tree).
+- `nu_m`: effective contribution of stage `m` to the final prediction.
+- `M`: number of boosting stages.
+- `learning_rate`: shrinkage factor that controls how aggressively each stage updates the model.
+- Boosting logic: each new tree focuses more on errors made by previous trees.
+
+### Workflow
+
+```{mermaid}
+flowchart LR
+  A[Read train/test parquet] --> B[Compute climatology and anomaly target]
+  B --> C[Create lag1/lag2 + calendar + exogenous features]
+  C --> D[Median imputation]
+  D --> E[Train AdaBoost regressor on fold train]
+  E --> F[Recursive validation rollout]
+  F --> G[OOF metrics and predictions]
+  G --> H[Refit on full train and produce test forecasts]
+```
+
+### Tuned Parameters and Effect
+
+```{python}
+make_param_df(
+    [
+        ("n_estimators", ad_cfg["n_estimators"], "Number of boosting stages."),
+        ("learning_rate", ad_cfg["learning_rate"], "Shrinkage per stage; smaller needs more estimators."),
+        ("max_depth", ad_cfg["max_depth"], "Depth of each base regression tree."),
+        ("loss", ad_cfg["loss"], "Boosting loss that controls how hard examples are re-weighted."),
+        ("lags", ad_cfg["lags"], "Autoregressive lag inputs for recursive forecasting."),
+    ]
+)
+```
+
+```{python}
+ad_cfg
+```
+
+```{python}
+ad_fold[["fold", "train_start", "train_end", "val_start", "val_end", "wmae", "mae", "rmse", "runtime_sec"]]
+```
+
+```{python}
+ad_mean[["wmae", "mae", "rmse", "runtime_sec"]]
+```
+
+```{python}
+plot_weekly_actual_vs_pred(ad_oof, "Model 6: AdaBoost | OOF Weekly Sales")
+```
+
+## Final Comparative
+
+### Full-Data Comparison (Phases 1, 2, 3, 4, 5, 7 + Phase 1-lite Diagnostic)
+
+```{python}
+full_comparison = pd.DataFrame(
+    [
+        {
+            "Model": "Local Linear Anomaly (Phase 1)",
+            "Mean WMAE": float(p1_mean["wmae"]),
+            "Mean MAE": float(p1_mean["mae"]),
+            "Mean RMSE": float(p1_mean["rmse"]),
+        },
+        {
+            "Model": "Structural AR (Phase 2)",
+            "Mean WMAE": float(p2_mean["wmae"]),
+            "Mean MAE": float(p2_mean["mae"]),
+            "Mean RMSE": float(p2_mean["rmse"]),
+        },
+        {
+            "Model": "Local Linear Lite (Phase 1-lite)",
+            "Mean WMAE": float(p1_lite_mean["wmae"]),
+            "Mean MAE": float(p1_lite_mean["mae"]),
+            "Mean RMSE": float(p1_lite_mean["rmse"]),
+        },
+        {
+            "Model": "Elastic Net (Phase 3)",
+            "Mean WMAE": float(en_mean["wmae"]),
+            "Mean MAE": float(en_mean["mae"]),
+            "Mean RMSE": float(en_mean["rmse"]),
+        },
+        {
+            "Model": "Random Forest (Phase 4)",
+            "Mean WMAE": float(rf_mean["wmae"]),
+            "Mean MAE": float(rf_mean["mae"]),
+            "Mean RMSE": float(rf_mean["rmse"]),
+        },
+        {
+            "Model": "ETS (Phase 5)",
+            "Mean WMAE": float(ets_mean["wmae"]),
+            "Mean MAE": float(ets_mean["mae"]),
+            "Mean RMSE": float(ets_mean["rmse"]),
+        },
+        {
+            "Model": "AdaBoost (Phase 7)",
+            "Mean WMAE": float(ad_mean["wmae"]),
+            "Mean MAE": float(ad_mean["mae"]),
+            "Mean RMSE": float(ad_mean["rmse"]),
+        },
+    ]
+).sort_values("Mean WMAE", ascending=True).reset_index(drop=True)
+full_comparison
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(8, 4))
+color_map = {
+    "Local Linear Anomaly (Phase 1)": "seagreen",
+    "Local Linear Lite (Phase 1-lite)": "darkgreen",
+    "Structural AR (Phase 2)": "firebrick",
+    "Elastic Net (Phase 3)": "mediumorchid",
+    "Random Forest (Phase 4)": "royalblue",
+    "ETS (Phase 5)": "teal",
+    "AdaBoost (Phase 7)": "darkorange",
+}
+bar_colors = [color_map[m] for m in full_comparison["Model"]]
+ax.bar(
+    full_comparison["Model"],
+    full_comparison["Mean WMAE"],
+    color=bar_colors,
+)
+ax.set_title("Full-Data Mean WMAE (Lower is Better)")
+ax.set_ylabel("Mean WMAE")
+ax.grid(axis="y", alpha=0.25)
+plt.xticks(rotation=10, ha="right")
+plt.tight_layout()
+plt.show()
+```
+
+## Conclusion
+
+- Full-data comparison is now apples-to-apples for all six models.
+- All tabular baselines share the same anomaly feature interface with `lag1` and `lag2`.
+- The ranking table above is the reference for selecting the best model in this run.

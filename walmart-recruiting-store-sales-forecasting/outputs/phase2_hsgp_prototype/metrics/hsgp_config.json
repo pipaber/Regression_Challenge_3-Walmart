@@ -1,0 +1,11 @@
+{
+  "n_folds": 4,
+  "val_weeks": 13,
+  "lengthscale_min": 0.2,
+  "lengthscale_max": 2.5,
+  "max_eval": 1000,
+  "pred_draws": 40,
+  "random_seed": 8927,
+  "max_series": 200,
+  "note": "Phase 2 uses recursive validation (predicted anomalies are fed back as lag features)."
+}

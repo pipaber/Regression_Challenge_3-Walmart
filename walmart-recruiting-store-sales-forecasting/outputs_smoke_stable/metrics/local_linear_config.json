@@ -1,0 +1,11 @@
+{
+  "kernel": "tricube",
+  "bandwidth": 6,
+  "min_samples": 16,
+  "ridge": 0.0001,
+  "coef_clip": 6.0,
+  "anom_clip_scale": 2.0,
+  "n_folds": 2,
+  "val_weeks": 6,
+  "max_series": 60
+}

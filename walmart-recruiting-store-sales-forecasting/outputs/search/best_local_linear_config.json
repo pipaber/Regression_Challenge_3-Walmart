@@ -1,0 +1,12 @@
+{
+  "kernel": "exponential",
+  "bandwidth": 8,
+  "min_samples": 12,
+  "ridge": 0.0001,
+  "coef_clip": 6.0,
+  "anom_clip_scale": 2.0,
+  "n_folds": 4,
+  "val_weeks": 13,
+  "selection_metric": "mean_wmae_then_worst_fold_wmae",
+  "selected_run_id": 11
+}

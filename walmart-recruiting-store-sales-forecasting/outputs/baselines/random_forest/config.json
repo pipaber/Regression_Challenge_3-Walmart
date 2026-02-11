@@ -1,0 +1,33 @@
+{
+  "model": "random_forest",
+  "target": "sales_anom",
+  "features": [
+    "lag1",
+    "lag2",
+    "week_of_year",
+    "month",
+    "is_holiday_int",
+    "temp_anom",
+    "fuel_anom",
+    "MarkDown1",
+    "MarkDown2",
+    "MarkDown3",
+    "MarkDown4",
+    "MarkDown5",
+    "CPI",
+    "Unemployment"
+  ],
+  "lags": [
+    1,
+    2
+  ],
+  "n_estimators": 120,
+  "max_depth": 18,
+  "min_samples_leaf": 2,
+  "max_features": "sqrt",
+  "n_folds": 4,
+  "val_weeks": 13,
+  "max_series": null,
+  "train_path": "train_feat.parquet",
+  "test_path": "test_feat.parquet"
+}

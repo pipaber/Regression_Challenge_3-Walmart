@@ -1,0 +1,32 @@
+{
+  "kernel": "tricube",
+  "bandwidth": 6,
+  "min_samples": 16,
+  "ridge": 0.0001,
+  "coef_clip": 6.0,
+  "anom_clip_scale": 2.0,
+  "lags": [
+    1,
+    2
+  ],
+  "use_interactions": false,
+  "interaction_cols": [],
+  "feature_cols": [
+    "temp_anom",
+    "fuel_anom",
+    "MarkDown1",
+    "MarkDown2",
+    "MarkDown3",
+    "MarkDown4",
+    "MarkDown5",
+    "CPI",
+    "Unemployment",
+    "sales_anom_lag1",
+    "sales_anom_lag2",
+    "is_holiday_int"
+  ],
+  "standard_scaler": true,
+  "n_folds": 4,
+  "val_weeks": 13,
+  "max_series": null
+}

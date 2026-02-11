@@ -1,0 +1,10 @@
+{
+  "n_folds": 2,
+  "val_weeks": 6,
+  "max_eval": 1200,
+  "random_seed": 8927,
+  "pred_draws": 30,
+  "fourier_order": 3,
+  "max_series": 40,
+  "note": "Structural AR model with hierarchical series intercept, trend, Fourier seasonality, and recursive validation."
+}

@@ -1,0 +1,36 @@
+{
+  "model": "ets",
+  "target": "sales_anom (via exogenous + ETS residual)",
+  "seasonal_periods": 52,
+  "exogenous_features": [
+    "temp_anom",
+    "fuel_anom",
+    "MarkDown1",
+    "MarkDown2",
+    "MarkDown3",
+    "MarkDown4",
+    "MarkDown5",
+    "CPI",
+    "Unemployment"
+  ],
+  "exog_alpha": 1.0,
+  "n_folds": 4,
+  "val_weeks": 13,
+  "max_series": null,
+  "cv_mode_counts": {
+    "level": 10599,
+    "level-trend": 1796,
+    "global-fallback": 77,
+    "last-value-fallback": 51,
+    "level-seasonal": 4
+  },
+  "test_mode_counts": {
+    "level": 2758,
+    "level-trend": 372,
+    "level-seasonal": 8,
+    "global-fallback": 11,
+    "last-value-fallback": 20
+  },
+  "train_path": "train_feat.parquet",
+  "test_path": "test_feat.parquet"
+}

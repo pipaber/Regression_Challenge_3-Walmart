@@ -1,0 +1,9 @@
+{
+  "kernel": "tricube",
+  "bandwidth": 6,
+  "min_samples": 16,
+  "ridge": 1e-06,
+  "n_folds": 2,
+  "val_weeks": 6,
+  "max_series": 60
+}
