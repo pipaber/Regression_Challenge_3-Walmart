@@ -121,9 +121,9 @@ grid_results = pd.read_csv(OUTPUTS / "search" / "phase1" / "search_results.csv")
 best_grid_cfg = json.loads((OUTPUTS / "search" / "phase1" / "best_config.json").read_text(encoding="utf-8"))
 
 # Phase 2 (full data)
-p2_cv = pd.read_csv(OUTPUTS / "phase2_structural_ar_full" / "metrics" / "structural_ar_cv.csv")
-p2_oof = pd.read_parquet(OUTPUTS / "phase2_structural_ar_full" / "preds" / "structural_ar_oof.parquet")
-p2_cfg = json.loads((OUTPUTS / "phase2_structural_ar_full" / "metrics" / "structural_ar_config.json").read_text(encoding="utf-8"))
+p2_cv = pd.read_csv(OUTPUTS / "phase2_structural_ar" / "metrics" / "structural_ar_cv.csv")
+p2_oof = pd.read_parquet(OUTPUTS / "phase2_structural_ar" / "preds" / "structural_ar_oof.parquet")
+p2_cfg = json.loads((OUTPUTS / "phase2_structural_ar" / "metrics" / "structural_ar_config.json").read_text(encoding="utf-8"))
 
 # Phase 3, 4, 5, 7 baselines
 en_cv = pd.read_csv(BASELINES / "elastic_net" / "metrics.csv")
