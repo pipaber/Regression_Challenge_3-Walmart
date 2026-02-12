@@ -218,7 +218,7 @@ $$
 
 ```{mermaid}
 flowchart LR
-  A[Read processed train/test parquet (data/3.processed)] --> B[Compute climatology per series/store/week]
+  A[Read processed train/test parquet] --> B[Compute climatology per series/store/week]
   B --> C[Create anomalies and lag1/lag2]
   C --> D[Use pre-imputed exogenous features + fill lag defaults]
   D --> E[Standard-scale Phase 1 features]
@@ -403,7 +403,7 @@ $$
 
 ```{mermaid}
 flowchart LR
-  A[Read processed train/test parquet (data/3.processed)] --> B[Compute climatology and anomalies]
+  A[Read processed train/test parquet] --> B[Compute climatology and anomalies]
   B --> C[Create lag1/lag2 and calendar features]
   C --> D[Build exogenous feature matrix]
   D --> E[Use pre-imputed exogenous features + standard scaling]
@@ -469,7 +469,7 @@ where each $T_b$ is grown on a bootstrap sample and split candidates are randomi
 
 ```{mermaid}
 flowchart LR
-  A[Read processed train/test parquet (data/3.processed)] --> B[Compute climatology and anomalies]
+  A[Read processed train/test parquet] --> B[Compute climatology and anomalies]
   B --> C[Create lag1/lag2 + calendar + exogenous features]
   C --> D[Use pre-imputed exogenous features]
   D --> E[Train Random Forest on fold train]
@@ -626,7 +626,7 @@ where stage weights depend on chosen boosting loss and learning rate. In practic
 
 ```{mermaid}
 flowchart LR
-  A[Read processed train/test parquet (data/3.processed)] --> B[Compute climatology and anomaly target]
+  A[Read processed train/test parquet] --> B[Compute climatology and anomaly target]
   B --> C[Create lag1/lag2 + calendar + exogenous features]
   C --> D[Use pre-imputed exogenous features]
   D --> E[Train AdaBoost regressor on fold train]
